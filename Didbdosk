@@ -1,0 +1,5345 @@
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import random
+import math
+import json
+from collections import Counter, defaultdict
+
+# ============================================================
+# ASTRA V4 — «ПЛАНЕТА, КОТОРОЙ НЕ ДОЛЖНО СУЩЕСТВОВАТЬ»
+# Интерфейс полностью на русском языке.
+# Только стандартная библиотека Python + tkinter.
+# ============================================================
+
+WINDOW_W = 1480
+WINDOW_H = 860
+MIN_W = 1240
+MIN_H = 720
+TICK_MS = 80
+MAX_POP = 420  # технический абсолютный предел, не цель популяции
+INITIAL_POP = 80
+GRID_W, GRID_H = 18, 12
+
+# Цвет последнего действия организма на карте.
+ACTION_FILL = {
+    "ИСКАТЬ РЕСУРСЫ": "#a9e6a2",
+    "ИСКАТЬ ВОДУ": "#9edcf2",
+    "УКРЫТЬСЯ": "#d9b8f0",
+    "ИССЛЕДОВАТЬ": "#f2c27b",
+    "ОТДЫХАТЬ": "#c5d0d8",
+    "ВОСПРОИЗВЕСТИСЬ": "#f2a6c7",
+    "ОЖИДАНИЕ": "#dce7ed",
+}
+
+BIOME_SHORT = {
+    "ОАЗИС": "О",
+    "ПУСТЫНЯ": "П",
+    "ЛЕДНИК": "Л",
+    "АНОМАЛИЯ": "А",
+}
+
+ACTIONS = [
+    "ИСКАТЬ РЕСУРСЫ",
+    "ИСКАТЬ ВОДУ",
+    "УКРЫТЬСЯ",
+    "ИССЛЕДОВАТЬ",
+    "ОТДЫХАТЬ",
+    "ВОСПРОИЗВЕСТИСЬ",
+]
+
+BIOMES = {
+    "ОАЗИС": {"resource": 0.95, "water": 0.95, "radiation": 0.12, "temp": 0.35},
+    "ПУСТЫНЯ": {"resource": 0.45, "water": 0.12, "radiation": 0.42, "temp": 0.82},
+    "ЛЕДНИК": {"resource": 0.18, "water": 0.80, "radiation": 0.25, "temp": 0.08},
+    "АНОМАЛИЯ": {"resource": 0.65, "water": 0.50, "radiation": 0.88, "temp": 0.50},
+}
+
+BIOME_FILL = {
+    "ОАЗИС": "#28513f",
+    "ПУСТЫНЯ": "#5a4929",
+    "ЛЕДНИК": "#29495f",
+    "АНОМАЛИЯ": "#5a315f",
+}
+
+BIOME_RU = {
+    "ОАЗИС": "ОАЗИС",
+    "ПУСТЫНЯ": "ПУСТЫНЯ",
+    "ЛЕДНИК": "ЛЕДНИК",
+    "АНОМАЛИЯ": "АНОМАЛИЯ",
+}
+
+
+def clamp(x, lo=0.0, hi=1.0):
+    return max(lo, min(hi, x))
+
+
+def percent(x):
+    return int(round(clamp(x) * 100))
+
+
+class Cell:
+    def __init__(self, biome):
+        self.biome = biome
+        b = BIOMES[biome]
+        self.resources = clamp(b["resource"] * random.uniform(0.68, 1.0))
+        self.water = clamp(b["water"] * random.uniform(0.68, 1.0))
+        self.radiation = clamp(b["radiation"] + random.uniform(-0.07, 0.07))
+        self.temperature = clamp(b["temp"] + random.uniform(-0.07, 0.07))
+        self.damage = 0.0
+
+    def regenerate(self, global_resource=0.6, global_water=0.6, stability=0.7):
+        # Восстановление медленное, но постоянное. Оно масштабируется
+        # состоянием глобальной среды и стабильностью планеты.
+        rates = {
+            "ОАЗИС": (0.0090, 0.0130),
+            "ПУСТЫНЯ": (0.0055, 0.0060),
+            "ЛЕДНИК": (0.0065, 0.0100),
+            "АНОМАЛИЯ": (0.0030, 0.0040),
+        }
+        resource_rate, water_rate = rates[self.biome]
+        recovery_factor = 0.55 + global_resource * 0.45 + stability * 0.20
+        water_factor = 0.55 + global_water * 0.45 + stability * 0.20
+        self.resources = clamp(self.resources + resource_rate * recovery_factor)
+        self.water = clamp(self.water + water_rate * water_factor)
+        self.damage = max(0.0, self.damage - 0.0035 * (0.55 + stability * 0.45))
+
+
+class Planet:
+    def __init__(self, settings=None):
+        settings = settings or {}
+        self.temperature = clamp(settings.get("temperature", 0.48))
+        self.water = clamp(settings.get("water", 0.53))
+        self.radiation = clamp(settings.get("radiation", 0.28))
+        self.resources = clamp(settings.get("resources", 0.62))
+        self.energy = clamp(settings.get("energy", 0.60))
+        self.stability = clamp(settings.get("stability", 0.72))
+        self.solar_activity = clamp(settings.get("solar_activity", 0.30))
+
+        self.base_temperature = self.temperature
+        self.base_water = self.water
+        self.base_radiation = self.radiation
+        self.base_resources = self.resources
+        self.base_energy = self.energy
+        self.base_stability = self.stability
+        self.base_solar_activity = self.solar_activity
+        self.storm = 0.0
+        self.age = 0
+        self.event = "ИНИЦИАЛИЗАЦИЯ"
+        self.cells = self._make_world()
+        self._apply_global_conditions()
+
+    def _make_world(self):
+        # Структурированная карта понятнее случайного шума:
+        # север — ледники, центр — оазисы/переходные зоны,
+        # юг — пустыни, аномалии встречаются редко.
+        cells = []
+        anomaly_cells = set()
+        anomaly_target = max(8, int(GRID_W * GRID_H * 0.055))
+
+        while len(anomaly_cells) < anomaly_target:
+            anomaly_cells.add(
+                (random.randrange(GRID_W), random.randrange(GRID_H))
+            )
+
+        for y in range(GRID_H):
+            row = []
+
+            for x in range(GRID_W):
+                if (x, y) in anomaly_cells:
+                    biome = "АНОМАЛИЯ"
+                else:
+                    north = y / max(1, GRID_H - 1)
+
+                    if north < 0.25:
+                        biome = (
+                            "ЛЕДНИК"
+                            if random.random() < 0.84
+                            else "ОАЗИС"
+                        )
+
+                    elif north > 0.72:
+                        biome = (
+                            "ПУСТЫНЯ"
+                            if random.random() < 0.84
+                            else "ОАЗИС"
+                        )
+
+                    else:
+                        biome = (
+                            "ОАЗИС"
+                            if random.random() < 0.72
+                            else "ПУСТЫНЯ"
+                        )
+
+                row.append(Cell(biome))
+
+            cells.append(row)
+
+        return cells
+
+    def _apply_global_conditions(self):
+        for row in self.cells:
+            for cell in row:
+                # Глобальные параметры не уничтожают различия биомов.
+                cell.temperature = clamp(
+                    cell.temperature * 0.62
+                    + self.temperature * 0.38
+                )
+
+                cell.water = clamp(
+                    cell.water * 0.52
+                    + self.water * 0.48
+                )
+
+                cell.resources = clamp(
+                    cell.resources * 0.52
+                    + self.resources * 0.48
+                )
+
+                cell.radiation = clamp(
+                    cell.radiation * 0.58
+                    + self.radiation * 0.42
+                )
+
+    def set_parameters(self, settings):
+        old_temperature = self.temperature
+        old_water = self.water
+        old_resources = self.resources
+        old_radiation = self.radiation
+
+        self.temperature = clamp(settings["temperature"])
+        self.water = clamp(settings["water"])
+        self.resources = clamp(settings["resources"])
+        self.radiation = clamp(settings["radiation"])
+        self.energy = clamp(settings["energy"])
+        self.stability = clamp(settings["stability"])
+        self.solar_activity = clamp(settings["solar_activity"])
+
+        self.base_temperature = self.temperature
+        self.base_water = self.water
+        self.base_resources = self.resources
+        self.base_radiation = self.radiation
+        self.base_energy = self.energy
+        self.base_stability = self.stability
+        self.base_solar_activity = self.solar_activity
+
+        d_temperature = (self.temperature - old_temperature) * 0.35
+        d_water = (self.water - old_water) * 0.30
+        d_resources = (self.resources - old_resources) * 0.30
+        d_radiation = (self.radiation - old_radiation) * 0.32
+
+        for row in self.cells:
+            for cell in row:
+                cell.temperature = clamp(
+                    cell.temperature + d_temperature
+                )
+                cell.water = clamp(
+                    cell.water + d_water
+                )
+                cell.resources = clamp(
+                    cell.resources + d_resources
+                )
+                cell.radiation = clamp(
+                    cell.radiation + d_radiation
+                )
+
+    def get_cell(self, x, y):
+        x = max(0, min(GRID_W - 1, int(x)))
+        y = max(0, min(GRID_H - 1, int(y)))
+        return self.cells[y][x]
+
+    def average_cell_stats(self):
+        all_cells = [c for row in self.cells for c in row]
+
+        return (
+            sum(c.resources for c in all_cells) / len(all_cells),
+            sum(c.water for c in all_cells) / len(all_cells),
+            sum(c.radiation for c in all_cells) / len(all_cells),
+            sum(c.temperature for c in all_cells) / len(all_cells),
+        )
+
+    def trigger_storm(self, intensity=None):
+        self.storm = clamp(
+            intensity
+            if intensity is not None
+            else random.uniform(0.55, 0.90)
+        )
+
+        self.solar_activity = clamp(
+            self.solar_activity + self.storm * 0.30
+        )
+
+        self.radiation = clamp(
+            self.radiation + self.storm * 0.24
+        )
+
+        self.stability = clamp(
+            self.stability - self.storm * 0.13
+        )
+
+        self.event = (
+            f"СОЛНЕЧНАЯ БУРЯ: интенсивность {self.storm:.2f}"
+        )
+
+        for row in self.cells:
+            for cell in row:
+                chance = (
+                    0.28
+                    if cell.biome != "АНОМАЛИЯ"
+                    else 0.72
+                )
+
+                if random.random() < chance:
+                    cell.radiation = clamp(
+                        cell.radiation + self.storm * 0.18
+                    )
+
+                    cell.damage = clamp(
+                        cell.damage + self.storm * 0.12
+                    )
+
+    def climate_shift(self, delta=None):
+        delta = (
+            delta
+            if delta is not None
+            else random.uniform(-0.10, 0.10)
+        )
+
+        self.temperature = clamp(
+            self.temperature + delta
+        )
+
+        # Изменение климата влияет плавно.
+        self.water = clamp(
+            self.water - delta * 0.16
+        )
+
+        self.stability = clamp(
+            self.stability - abs(delta) * 0.30
+        )
+
+        self.event = (
+            f"ИЗМЕНЕНИЕ КЛИМАТА: ΔT {delta:+.2f}"
+        )
+
+        for row in self.cells:
+            for cell in row:
+                cell.temperature = clamp(
+                    cell.temperature + delta * 0.45
+                )
+
+                cell.water = clamp(
+                    cell.water - delta * 0.08
+                )
+
+    def step(self, population_pressure=0.0):
+        self.age += 1
+        self.event = ""
+
+        # Фоновые параметры медленно возвращаются
+        # к выбранным базовым значениям.
+        self.solar_activity = clamp(
+            self.solar_activity * 0.985
+            + self.base_solar_activity * 0.015
+            + random.uniform(-0.008, 0.008)
+        )
+
+        self.storm = max(
+            0.0,
+            self.storm - 0.028
+        )
+
+        avg_r, avg_w, avg_rad, avg_t = self.average_cell_stats()
+
+        self.temperature = clamp(
+            self.temperature * 0.975
+            + self.base_temperature * 0.019
+            + avg_t * 0.006
+            + random.uniform(-0.0025, 0.0025)
+        )
+
+        self.water = clamp(
+            self.water * 0.992
+            + self.base_water * 0.005
+            + avg_w * 0.003
+            - population_pressure * 0.00005
+        )
+
+        self.resources = clamp(
+            self.resources * 0.992
+            + self.base_resources * 0.005
+            + avg_r * 0.003
+            - population_pressure * 0.00007
+        )
+
+        self.radiation = clamp(
+            self.radiation * 0.987
+            + self.base_radiation * 0.010
+            + avg_rad * 0.002
+            + self.solar_activity * 0.00025
+        )
+
+        self.energy = clamp(
+            self.energy * 0.995
+            + self.base_energy * 0.005
+        )
+
+        self.stability = clamp(
+            self.stability * 0.9945
+            + self.base_stability * 0.0055
+            - max(
+                0.0,
+                population_pressure - 0.75
+            ) * 0.001
+        )
+
+        for row in self.cells:
+            for cell in row:
+                cell.regenerate(
+                    self.resources,
+                    self.water,
+                    self.stability
+                )
+
+        if (
+            self.age > 50
+            and random.random()
+            < 0.0028 * (0.65 + self.solar_activity)
+        ):
+            self.trigger_storm()
+
+        elif (
+            self.age > 100
+            and random.random() < 0.0020
+        ):
+            self.climate_shift()
+
+
+class Genome:
+    KEYS = [
+        "resource_drive",
+        "water_drive",
+        "safety_drive",
+        "exploration_drive",
+        "rest_drive",
+        "reproduction_drive",
+        "memory_weight",
+        "risk_tolerance",
+        "adaptation_rate",
+    ]
+
+    LABELS = {
+        "resource_drive": "поиск ресурсов",
+        "water_drive": "поиск воды",
+        "safety_drive": "осторожность",
+        "exploration_drive": "исследование",
+        "rest_drive": "отдых",
+        "reproduction_drive": "размножение",
+        "memory_weight": "влияние памяти",
+        "risk_tolerance": "терпимость к риску",
+        "adaptation_rate": "скорость адаптации",
+    }
+
+    def __init__(self, values=None):
+        if values is None:
+            self.values = {
+                k: random.uniform(0.25, 0.75)
+                for k in self.KEYS
+            }
+        else:
+            self.values = dict(values)
+
+    def mutate(self, strength=0.06):
+        return Genome({
+            key: clamp(
+                value + random.gauss(0, strength)
+            )
+            for key, value in self.values.items()
+        })
+
+    def distance(self, other):
+        return sum(
+            abs(
+                self.values[k]
+                - other.values[k]
+            )
+            for k in self.KEYS
+        ) / len(self.KEYS)
+
+
+class Decision:
+    def __init__(self, action, scores):
+        self.action = action
+        self.scores = scores
+
+
+class Organism:
+    next_id = 1
+
+    def __init__(
+        self,
+        x,
+        y,
+        genome=None,
+        generation=0,
+        parent_id=None
+    ):
+        self.id = Organism.next_id
+        Organism.next_id += 1
+
+        self.x = x
+        self.y = y
+
+        self.genome = genome or Genome()
+
+        self.generation = generation
+        self.parent_id = parent_id
+
+        self.age = 0
+
+        # Умеренно высокие стартовые запасы.
+        self.energy = random.uniform(0.68, 0.88)
+        self.hydration = random.uniform(0.68, 0.88)
+        self.health = random.uniform(0.94, 1.0)
+
+        self.memory = 0.5
+
+        self.last_action = "ОЖИДАНИЕ"
+        self.last_reward = 0.0
+
+        self.alive = True
+
+        self.children = 0
+        self.total_actions = 0
+        self.successes = 0
+
+        self.last_decision = None
+
+        # Важный элемент нового баланса.
+        # Организм не может постоянно размножаться.
+        self.reproduction_cooldown = random.randint(0, 90)
+
+    def sense(self, planet):
+        cell = planet.get_cell(
+            self.x,
+            self.y
+        )
+
+        danger = clamp(
+            cell.radiation * 0.68
+            + cell.damage * 0.32
+        )
+
+        temperature_stress = clamp(
+            abs(cell.temperature - 0.52) * 1.45
+        )
+
+        return {
+            "resource": cell.resources,
+            "water": cell.water,
+            "danger": danger,
+            "scarcity": 1.0 - cell.resources,
+            "thirst": 1.0 - self.hydration,
+            "hunger": 1.0 - self.energy,
+            "cold": max(
+                0.0,
+                0.22 - cell.temperature
+            ) / 0.22,
+            "heat": max(
+                0.0,
+                cell.temperature - 0.72
+            ) / 0.28,
+            "temperature_stress": temperature_stress,
+            "stability": planet.stability,
+        }
+
+    def _reproduction_environment_score(self, planet):
+        cell = planet.get_cell(
+            self.x,
+            self.y
+        )
+
+        local_safety = 1.0 - clamp(
+            cell.radiation * 0.75
+            + cell.damage * 0.25
+        )
+
+        local_thermal = 1.0 - min(
+            1.0,
+            abs(cell.temperature - 0.52) * 1.65
+        )
+
+        local_balance = math.sqrt(
+            max(
+                0.0,
+                cell.resources * cell.water
+            )
+        )
+
+        local_quality = clamp(
+            local_balance * 0.46
+            + local_safety * 0.18
+            + local_thermal * 0.10
+            + planet.stability * 0.08
+            + planet.energy * 0.08
+            + (
+                0.10
+                * math.sqrt(
+                    max(
+                        0.0,
+                        planet.resources
+                        * planet.water
+                    )
+                )
+            )
+        )
+
+        global_safety = 1.0 - clamp(
+            planet.radiation
+        )
+
+        global_thermal = 1.0 - min(
+            1.0,
+            abs(planet.temperature - 0.52) * 1.50
+        )
+
+        global_balance = math.sqrt(
+            max(
+                0.0,
+                planet.resources * planet.water
+            )
+        )
+
+        global_quality = clamp(
+            global_balance * 0.50
+            + global_safety * 0.20
+            + global_thermal * 0.10
+            + planet.stability * 0.10
+            + planet.energy * 0.10
+        )
+
+        return clamp(
+            local_quality * 0.45
+            + global_quality * 0.55
+        )
+
+    def decide(
+        self,
+        planet,
+        population_ratio=0.0
+    ):
+        s = self.sense(planet)
+        g = self.genome.values
+
+        environment = (
+            self._reproduction_environment_score(
+                planet
+            )
+        )
+
+        # Плотность популяции влияет постепенно.
+        density_factor = clamp(
+            1.0
+            - max(
+                0.0,
+                population_ratio - 0.35
+            ) / 0.90
+        )
+
+        scores = {
+            "ИСКАТЬ РЕСУРСЫ": (
+                g["resource_drive"]
+                * (
+                    0.22
+                    + s["scarcity"] * 0.92
+                    + s["hunger"] * 1.15
+                )
+            ),
+
+            "ИСКАТЬ ВОДУ": (
+                g["water_drive"]
+                * (
+                    0.22
+                    + s["thirst"] * 1.45
+                    + (1.0 - s["water"]) * 0.95
+                )
+            ),
+
+            "УКРЫТЬСЯ": (
+                g["safety_drive"]
+                * (
+                    0.10
+                    + s["danger"] * 1.90
+                    + s["heat"] * 0.35
+                    + s["cold"] * 0.18
+                )
+            ),
+
+            "ИССЛЕДОВАТЬ": (
+                g["exploration_drive"]
+                * (
+                    0.18
+                    + s["stability"] * 0.60
+                )
+                * (
+                    0.60
+                    + g["risk_tolerance"]
+                )
+            ),
+
+            "ОТДЫХАТЬ": (
+                g["rest_drive"]
+                * (
+                    0.12
+                    + max(
+                        0.0,
+                        0.70 - self.energy
+                    ) * 0.70
+                    + max(
+                        0.0,
+                        0.68 - self.hydration
+                    ) * 0.45
+                    + max(
+                        0.0,
+                        0.78 - self.health
+                    ) * 0.55
+                )
+            ),
+
+            "ВОСПРОИЗВЕСТИСЬ": 0.0,
+        }
+
+        # Память усиливает повторение удачной стратегии,
+        # но влияние специально ограничено.
+        memory_bias = (
+            self.memory
+            * g["memory_weight"]
+            * self.last_reward
+            * 0.22
+        )
+
+        if self.last_action in scores:
+            scores[self.last_action] += memory_bias
+
+        mature = clamp(
+            (self.age - 70.0) / 90.0
+        )
+
+        condition = min(
+            clamp(
+                (self.energy - 0.55) / 0.40
+            ),
+            clamp(
+                (self.hydration - 0.55) / 0.40
+            ),
+            self.health,
+        )
+
+        readiness = (
+            mature
+            * condition
+            * environment
+            * density_factor
+        )
+
+        if (
+            self.reproduction_cooldown <= 0
+            and self.age >= 90
+            and self.energy >= 0.72
+            and self.hydration >= 0.70
+            and self.health >= 0.78
+            and environment >= 0.46
+            and population_ratio < 0.93
+        ):
+            # Размножение конкурирует с выживанием,
+            # но не становится самым сильным действием
+            # сразу после созревания.
+            scores["ВОСПРОИЗВЕСТИСЬ"] = (
+                g["reproduction_drive"]
+                * (
+                    0.045
+                    + readiness * 0.62
+                )
+            )
+        else:
+            scores["ВОСПРОИЗВЕСТИСЬ"] = 0.006
+
+        scores["ИССЛЕДОВАТЬ"] *= (
+            0.45
+            + 0.50
+            * g["risk_tolerance"]
+        )
+
+        # Дефицит сначала заставляет организм выживать.
+        if self.hydration < 0.34:
+            scores["ИСКАТЬ ВОДУ"] *= 2.10
+            scores["ВОСПРОИЗВЕСТИСЬ"] = 0.006
+
+        if self.energy < 0.34:
+            scores["ИСКАТЬ РЕСУРСЫ"] *= 2.05
+            scores["ВОСПРОИЗВЕСТИСЬ"] = 0.006
+
+        if self.health < 0.45:
+            scores["ОТДЫХАТЬ"] *= 1.70
+            scores["УКРЫТЬСЯ"] *= 1.35
+            scores["ВОСПРОИЗВЕСТИСЬ"] = 0.006
+
+        if (
+            s["danger"] > 0.62
+            or planet.radiation > 0.72
+        ):
+            scores["УКРЫТЬСЯ"] *= 1.90
+            scores["ВОСПРОИЗВЕСТИСЬ"] = min(
+                scores["ВОСПРОИЗВЕСТИСЬ"],
+                0.02
+            )
+
+        action = max(
+            scores,
+            key=scores.get
+        )
+
+        return Decision(
+            action,
+            scores
+        )
+
+    def _move_to_better_neighbor(
+        self,
+        planet,
+        attribute
+    ):
+        candidates = []
+
+        for dx, dy in (
+            (1, 0),
+            (-1, 0),
+            (0, 1),
+            (0, -1),
+            (1, 1),
+            (1, -1),
+            (-1, 1),
+            (-1, -1),
+        ):
+            nx = self.x + dx
+            ny = self.y + dy
+
+            if (
+                0 <= nx < GRID_W
+                and 0 <= ny < GRID_H
+            ):
+                c = planet.get_cell(
+                    nx,
+                    ny
+                )
+
+                value = (
+                    getattr(c, attribute)
+                    - c.radiation * 0.48
+                    - c.damage * 0.32
+                )
+
+                candidates.append(
+                    (value, nx, ny)
+                )
+
+        if candidates:
+            current = planet.get_cell(
+                self.x,
+                self.y
+            )
+
+            current_value = (
+                getattr(current, attribute)
+                - current.radiation * 0.48
+                - current.damage * 0.32
+            )
+
+            best = max(candidates)
+
+            if best[0] > current_value + 0.035:
+                _, self.x, self.y = best
+
+    def _move_to_safer_neighbor(
+        self,
+        planet
+    ):
+        candidates = []
+
+        for dx, dy in (
+            (1, 0),
+            (-1, 0),
+            (0, 1),
+            (0, -1),
+            (1, 1),
+            (1, -1),
+            (-1, 1),
+            (-1, -1),
+        ):
+            nx = self.x + dx
+            ny = self.y + dy
+
+            if (
+                0 <= nx < GRID_W
+                and 0 <= ny < GRID_H
+            ):
+                c = planet.get_cell(
+                    nx,
+                    ny
+                )
+
+                score = (
+                    (1.0 - c.radiation) * 0.72
+                    + (1.0 - c.damage) * 0.18
+                    + c.water * 0.05
+                    + c.resources * 0.05
+                )
+
+                candidates.append(
+                    (score, nx, ny)
+                )
+
+        if candidates:
+            _, self.x, self.y = max(
+                candidates
+            )
+
+    def act(
+        self,
+        planet,
+        population_ratio=0.0
+    ):
+        if not self.alive:
+            return 0.0, None
+
+        self.age += 1
+        self.total_actions += 1
+
+        self.reproduction_cooldown = max(
+            0,
+            self.reproduction_cooldown - 1
+        )
+
+        decision = self.decide(
+            planet,
+            population_ratio
+        )
+
+        self.last_decision = decision
+
+        action = decision.action
+
+        cell = planet.get_cell(
+            self.x,
+            self.y
+        )
+
+        old_energy = self.energy
+        old_hydration = self.hydration
+
+        reward = -0.008
+
+        # Базовый метаболизм небольшой.
+        self.energy -= (
+            0.0022
+            + cell.temperature * 0.0005
+        )
+
+        self.hydration -= (
+            0.0016
+            + max(
+                0.0,
+                cell.temperature - 0.60
+            ) * 0.0028
+        )
+
+        competition = (
+            1.0
+            - min(
+                0.30,
+                max(
+                    0.0,
+                    population_ratio - 0.25
+                ) * 0.30
+            )
+        )
+
+        if action == "ИСКАТЬ РЕСУРСЫ":
+            resource_factor = (
+                0.20
+                + 0.80 * planet.resources
+            )
+
+            amount = min(
+                cell.resources,
+                (
+                    0.045
+                    + 0.035
+                    * random.random()
+                )
+                * competition
+                * resource_factor
+            )
+
+            cell.resources = clamp(
+                cell.resources - amount
+            )
+
+            energy_conversion = (
+                0.78
+                + planet.energy * 0.20
+            )
+
+            self.energy = clamp(
+                self.energy
+                + amount
+                * energy_conversion
+            )
+
+            reward = (
+                amount
+                * (
+                    1.05
+                    + planet.energy * 0.20
+                )
+                - 0.010
+            )
+
+            self.successes += int(
+                amount > 0.028
+            )
+
+            if (
+                cell.resources < 0.30
+                or amount < 0.035
+                or random.random() < 0.16
+            ):
+                self._move_to_better_neighbor(
+                    planet,
+                    "resources"
+                )
+
+        elif action == "ИСКАТЬ ВОДУ":
+            water_factor = (
+                0.20
+                + 0.80 * planet.water
+            )
+
+            amount = min(
+                cell.water,
+                (
+                    0.050
+                    + 0.040
+                    * random.random()
+                )
+                * competition
+                * water_factor
+            )
+
+            cell.water = clamp(
+                cell.water - amount
+            )
+
+            self.hydration = clamp(
+                self.hydration
+                + amount
+            )
+
+            reward = (
+                amount * 1.18
+                - 0.010
+            )
+
+            self.successes += int(
+                amount > 0.032
+            )
+
+            if (
+                cell.water < 0.30
+                or amount < 0.040
+                or random.random() < 0.16
+            ):
+                self._move_to_better_neighbor(
+                    planet,
+                    "water"
+                )
+
+        elif action == "УКРЫТЬСЯ":
+            self.energy -= 0.0010
+
+            self.health = clamp(
+                self.health
+                + (
+                    0.0045
+                    if (
+                        cell.radiation < 0.42
+                        and cell.damage < 0.25
+                    )
+                    else 0.0015
+                )
+            )
+
+            if cell.radiation > 0.60:
+                self._move_to_safer_neighbor(
+                    planet
+                )
+
+            reward = (
+                0.028
+                if cell.radiation > 0.45
+                else 0.006
+            )
+
+        elif action == "ИССЛЕДОВАТЬ":
+            self.energy -= 0.012
+            self.hydration -= 0.007
+
+            # Исследование движется к клеткам
+            # с хорошим балансом условий.
+            candidates = []
+
+            for dx, dy in (
+                (1, 0),
+                (-1, 0),
+                (0, 1),
+                (0, -1),
+                (1, 1),
+                (1, -1),
+                (-1, 1),
+                (-1, -1),
+            ):
+                nx = self.x + dx
+                ny = self.y + dy
+
+                if (
+                    0 <= nx < GRID_W
+                    and 0 <= ny < GRID_H
+                ):
+                    c = planet.get_cell(
+                        nx,
+                        ny
+                    )
+
+                    score = (
+                        c.resources * 0.38
+                        + c.water * 0.38
+                        + (
+                            1.0
+                            - c.radiation
+                        ) * 0.24
+                    )
+
+                    candidates.append(
+                        (score, nx, ny)
+                    )
+
+            if (
+                candidates
+                and random.random() < 0.72
+            ):
+                _, self.x, self.y = max(
+                    candidates
+                )
+
+            elif candidates:
+                _, self.x, self.y = random.choice(
+                    candidates
+                )
+
+            new_cell = planet.get_cell(
+                self.x,
+                self.y
+            )
+
+            discovery = (
+                new_cell.resources
+                + new_cell.water
+            ) * 0.055
+
+            reward = (
+                discovery
+                - new_cell.radiation * 0.025
+            )
+
+        elif action == "ОТДЫХАТЬ":
+            self.energy = clamp(
+                self.energy + 0.006
+            )
+
+            self.hydration = clamp(
+                self.hydration + 0.001
+            )
+
+            self.health = clamp(
+                self.health + 0.007
+            )
+
+            reward = 0.014
+
+        elif action == "ВОСПРОИЗВЕСТИСЬ":
+            reward = 0.010
+
+        # Экологический стресс действует только
+        # при действительно плохих условиях.
+        radiation_stress = max(
+            0.0,
+            cell.radiation - 0.25
+        )
+
+        heat_stress = max(
+            0.0,
+            cell.temperature - 0.76
+        )
+
+        cold_stress = max(
+            0.0,
+            0.20 - cell.temperature
+        )
+
+        deprivation = (
+            max(
+                0.0,
+                0.25 - self.energy
+            )
+            + max(
+                0.0,
+                0.25 - self.hydration
+            )
+        )
+
+        self.health -= (
+            radiation_stress
+            * 0.0036
+        )
+
+        self.health -= (
+            cell.damage
+            * 0.0022
+        )
+
+        self.health -= (
+            heat_stress
+            * 0.0038
+        )
+
+        self.health -= (
+            cold_stress
+            * 0.0028
+        )
+
+        self.health -= (
+            deprivation
+            * 0.011
+        )
+
+        global_scarcity = max(
+            0.0,
+            0.34
+            - math.sqrt(
+                max(
+                    0.0,
+                    planet.resources
+                    * planet.water
+                )
+            )
+        )
+
+        self.health -= (
+            global_scarcity
+            * 0.0018
+        )
+
+        # В нормальной среде здоровье
+        # медленно восстанавливается.
+        safe_recovery = max(
+            0.0,
+            0.55 - cell.radiation
+        ) * 0.0015
+
+        self.health = clamp(
+            self.health
+            + safe_recovery
+        )
+
+        # Старение мягкое.
+        if self.age > 2500:
+            self.health -= min(
+                0.00008,
+                (
+                    self.age - 3200
+                ) * 0.000000035
+            )
+
+        self.energy = clamp(
+            self.energy
+        )
+
+        self.hydration = clamp(
+            self.hydration
+        )
+
+        self.health = clamp(
+            self.health
+        )
+
+        reward += (
+            (
+                self.energy
+                - old_energy
+            ) * 0.35
+            + (
+                self.hydration
+                - old_hydration
+            ) * 0.35
+        )
+
+        lr = (
+            0.009
+            * self.genome.values[
+                "adaptation_rate"
+            ]
+        )
+
+        self.memory = clamp(
+            self.memory
+            + reward * lr
+        )
+
+        if reward > 0:
+            self.genome.values[
+                "adaptation_rate"
+            ] = clamp(
+                self.genome.values[
+                    "adaptation_rate"
+                ]
+                + 0.00045
+            )
+
+        else:
+            self.genome.values[
+                "risk_tolerance"
+            ] = clamp(
+                self.genome.values[
+                    "risk_tolerance"
+                ]
+                - 0.00030
+            )
+
+        self.last_action = action
+        self.last_reward = reward
+
+        # Смерть только при реально критическом
+        # состоянии или предельном возрасте.
+        if (
+            self.energy <= 0.002
+            or self.hydration <= 0.002
+            or self.health <= 0.03
+            or self.age > 6500
+        ):
+            self.alive = False
+
+        return reward, action
+
+    def reproduction_readiness(
+        self,
+        planet,
+        population_ratio=0.0
+    ):
+        environment = (
+            self._reproduction_environment_score(
+                planet
+            )
+        )
+
+        mature = clamp(
+            (self.age - 70.0) / 100.0
+        )
+
+        condition = min(
+            clamp(
+                (self.energy - 0.55)
+                / 0.40
+            ),
+            clamp(
+                (self.hydration - 0.55)
+                / 0.40
+            ),
+            self.health,
+        )
+
+        density = clamp(
+            1.0
+            - max(
+                0.0,
+                population_ratio - 0.35
+            ) / 0.90
+        )
+
+        return clamp(
+            mature
+            * condition
+            * environment
+            * density
+        )
+
+    def can_reproduce(
+        self,
+        planet=None,
+        population_ratio=0.0
+    ):
+        if not self.alive:
+            return False
+
+        if self.reproduction_cooldown > 0:
+            return False
+
+        if self.age < 90:
+            return False
+
+        if (
+            self.energy < 0.72
+            or self.hydration < 0.70
+            or self.health < 0.78
+        ):
+            return False
+
+        if population_ratio >= 0.93:
+            return False
+
+        if (
+            planet is not None
+            and self._reproduction_environment_score(
+                planet
+            ) < 0.46
+        ):
+            return False
+
+        return True
+
+    def reproduce(
+        self,
+        mutation_strength,
+        planet=None,
+        population_ratio=0.0,
+        approved=False
+    ):
+        if (
+            not approved
+            and not self.can_reproduce(
+                planet,
+                population_ratio
+            )
+        ):
+            return None
+
+        # Умеренная цена воспроизводства +
+        # длинный cooldown.
+        self.energy -= 0.085
+        self.hydration -= 0.060
+        self.reproduction_cooldown = 420
+
+        child = Organism(
+            self.x,
+            self.y,
+            self.genome.mutate(
+                mutation_strength
+            ),
+            generation=self.generation + 1,
+            parent_id=self.id,
+        )
+
+        child.energy = random.uniform(
+            0.40,
+            0.50
+        )
+
+        child.hydration = random.uniform(
+            0.42,
+            0.53
+        )
+
+        child.health = random.uniform(
+            0.84,
+            0.95
+        )
+
+        child.reproduction_cooldown = 120
+
+        self.children += 1
+
+        return child
+
+
+class Simulation:
+    def __init__(self, settings=None):
+        self.settings = (
+            settings
+            or self.default_settings()
+        )
+
+        self.mutation_strength = (
+            self.settings.get(
+                "mutation_strength",
+                0.055
+            )
+        )
+
+        self.initial_population = int(
+            self.settings.get(
+                "initial_population",
+                INITIAL_POP
+            )
+        )
+
+        self.reset()
+
+    @staticmethod
+    def default_settings():
+        return {
+            "temperature": 0.48,
+            "water": 0.53,
+            "resources": 0.62,
+            "radiation": 0.28,
+            "energy": 0.60,
+            "stability": 0.72,
+            "solar_activity": 0.30,
+            "mutation_strength": 0.055,
+            "initial_population": INITIAL_POP,
+        }
+
+    def _spawn_location(self, used=None):
+        used = used or set()
+
+        candidates = []
+
+        for y in range(GRID_H):
+            for x in range(GRID_W):
+                cell = self.planet.get_cell(
+                    x,
+                    y
+                )
+
+                global_resource_factor = (
+                    0.35
+                    + 0.65
+                    * self.planet.resources
+                )
+
+                global_water_factor = (
+                    0.35
+                    + 0.65
+                    * self.planet.water
+                )
+
+                suitability = (
+                    cell.resources
+                    * global_resource_factor
+                    * 0.34
+                    + cell.water
+                    * global_water_factor
+                    * 0.34
+                    + (
+                        1.0
+                        - cell.radiation
+                    ) * 0.22
+                    + (
+                        1.0
+                        - cell.damage
+                    ) * 0.10
+                )
+
+                if (x, y) in used:
+                    suitability *= 0.55
+
+                candidates.append(
+                    (
+                        suitability,
+                        x,
+                        y
+                    )
+                )
+
+        candidates.sort(
+            reverse=True
+        )
+
+        top = candidates[
+            :max(
+                20,
+                len(candidates) // 2
+            )
+        ]
+
+        _, x, y = random.choice(
+            top
+        )
+
+        return x, y
+
+    def reset(self):
+        Organism.next_id = 1
+
+        self.planet = Planet(
+            self.settings
+        )
+
+        self.population = []
+
+        used = set()
+
+        for _ in range(
+            self.initial_population
+        ):
+            x, y = self._spawn_location(
+                used
+            )
+
+            used.add(
+                (x, y)
+            )
+
+            self.population.append(
+                Organism(x, y)
+            )
+
+        self.tick = 0
+
+        self.births = (
+            self.initial_population
+        )
+
+        self.deaths = 0
+        self.max_generation = 0
+        self.history = []
+        self.journal = []
+
+        self.selected_id = (
+            self.population[0].id
+            if self.population
+            else None
+        )
+
+        self.last_decision = None
+
+        self.before_snapshot = self.snapshot(
+            "НАЧАЛО"
+        )
+
+        self.after_snapshot = None
+
+        self._log(
+            "ПЛАНЕТА A-17 ИНИЦИАЛИЗИРОВАНА"
+        )
+
+        self._log(
+            f"СОЗДАНО ОСОБЕЙ: {len(self.population)}"
+        )
+
+    def _log(self, text):
+        self.journal.append(
+            f"[{self.tick:05d}] {text}"
+        )
+
+        self.journal = self.journal[
+            -150:
+        ]
+
+    def snapshot(self, label):
+        alive = [
+            o
+            for o in self.population
+            if o.alive
+        ]
+
+        energies = [
+            o.energy
+            for o in alive
+        ]
+
+        health = [
+            o.health
+            for o in alive
+        ]
+
+        return {
+            "label": label,
+            "tick": self.tick,
+            "population": len(alive),
+            "generation": self.max_generation,
+            "capacity": self.carrying_capacity(),
+            "avg_energy": (
+                sum(energies)
+                / len(energies)
+                if energies
+                else 0
+            ),
+            "avg_health": (
+                sum(health)
+                / len(health)
+                if health
+                else 0
+            ),
+            "planet_resources": (
+                self.planet.resources
+            ),
+            "planet_water": (
+                self.planet.water
+            ),
+            "planet_radiation": (
+                self.planet.radiation
+            ),
+            "entropy": self.entropy(),
+        }
+
+    def entropy(self):
+        alive = [
+            o
+            for o in self.population
+            if o.alive
+        ]
+
+        if not alive:
+            return 0.0
+
+        counts = Counter(
+            o.last_action
+            for o in alive
+        )
+
+        total = sum(
+            counts.values()
+        )
+
+        if total <= 0:
+            return 0.0
+
+        return -sum(
+            (
+                n / total
+            )
+            * math.log2(
+                n / total
+            )
+            for n in counts.values()
+            if n
+        )
+
+    def carrying_capacity(self):
+        # Экологическая ёмкость считается по
+        # «узкому месту»: одновременно малое
+        # количество воды и ресурсов резко снижает
+        # поддерживаемую популяцию.
+        (
+            avg_resources,
+            avg_water,
+            avg_radiation,
+            avg_temperature
+        ) = self.planet.average_cell_stats()
+
+        local_balance = math.sqrt(
+            max(
+                0.0,
+                avg_resources
+                * avg_water
+            )
+        )
+
+        local_safety = (
+            1.0
+            - clamp(
+                avg_radiation
+                * 0.90
+            )
+        )
+
+        local_thermal = (
+            1.0
+            - min(
+                1.0,
+                abs(
+                    avg_temperature
+                    - 0.52
+                ) * 1.55
+            )
+        )
+
+        local_quality = clamp(
+            local_balance * 0.52
+            + local_safety * 0.18
+            + self.planet.stability * 0.10
+            + self.planet.energy * 0.08
+            + local_thermal * 0.12
+        )
+
+        global_balance = math.sqrt(
+            max(
+                0.0,
+                self.planet.base_resources
+                * self.planet.base_water
+            )
+        )
+
+        global_safety = (
+            1.0
+            - clamp(
+                self.planet.base_radiation
+            )
+        )
+
+        global_thermal = (
+            1.0
+            - min(
+                1.0,
+                abs(
+                    self.planet.base_temperature
+                    - 0.52
+                ) * 1.50
+            )
+        )
+
+        global_quality = clamp(
+            global_balance * 0.50
+            + global_safety * 0.19
+            + self.planet.base_stability * 0.11
+            + self.planet.base_energy * 0.09
+            + global_thermal * 0.11
+        )
+
+        quality = clamp(
+            global_quality * 0.68
+            + local_quality * 0.32
+        )
+
+        minimum_capacity = 20
+        maximum_ecological_capacity = 340
+
+        return int(
+            minimum_capacity
+            + (
+                maximum_ecological_capacity
+                - minimum_capacity
+            ) * quality
+        )
+
+    def behavioral_diversity(self):
+        alive = [
+            o
+            for o in self.population
+            if o.alive
+        ]
+
+        if len(alive) < 2:
+            return 0.0
+
+        sample = alive[:40]
+
+        pair_count = min(
+            180,
+            len(sample)
+            * (len(sample) - 1)
+            // 2
+        )
+
+        values = []
+
+        for _ in range(
+            pair_count
+        ):
+            a, b = random.sample(
+                sample,
+                2
+            )
+
+            values.append(
+                a.genome.distance(b.genome)
+            )
+
+        return (
+            sum(values)
+            / len(values)
+            if values
+            else 0.0
+        )
+
+    def step(self):
+        alive_before = [
+            o
+            for o in self.population
+            if o.alive
+        ]
+
+        if not alive_before:
+            self._log(
+                "ВЫМИРАНИЕ — СИМУЛЯЦИЯ ОСТАНОВЛЕНА"
+            )
+
+            self.after_snapshot = self.snapshot(
+                "КОНЕЦ"
+            )
+
+            return
+
+        newborns = []
+        actions = Counter()
+
+        total_latency = 0.0
+        total_efficiency = 0.0
+
+        capacity = self.carrying_capacity()
+
+        population_ratio = (
+            len(alive_before)
+            / max(
+                1,
+                capacity
+            )
+        )
+
+        for organism in alive_before:
+            latency = (
+                0.46
+                + len(ACTIONS) * 0.045
+                + organism.genome.values[
+                    "memory_weight"
+                ] * 0.10
+            )
+
+            total_latency += latency
+
+            decision_before = organism.decide(
+                self.planet,
+                population_ratio
+            )
+
+            readiness = (
+                organism.reproduction_readiness(
+                    self.planet,
+                    population_ratio
+                )
+            )
+
+            approved_reproduction = (
+                decision_before.action
+                == "ВОСПРОИЗВЕСТИСЬ"
+                and organism.can_reproduce(
+                    self.planet,
+                    population_ratio
+                )
+                and (
+                    len(alive_before)
+                    + len(newborns)
+                ) < capacity
+            )
+
+            reward, action = organism.act(
+                self.planet,
+                population_ratio
+            )
+
+            actions[action] += 1
+
+            total_efficiency += max(
+                0.0,
+                reward + 0.06
+            )
+
+            if (
+                action
+                == "ВОСПРОИЗВЕСТИСЬ"
+                and approved_reproduction
+            ):
+                # Вероятность рождения невысокая.
+                free_space = clamp(
+                    1.0
+                    - population_ratio
+                )
+
+                reproduction_chance = clamp(
+                    0.12
+                    + readiness * 0.34
+                    + free_space * 0.18
+                )
+
+                if (
+                    random.random()
+                    > reproduction_chance
+                ):
+                    continue
+
+                if (
+                    len(alive_before)
+                    + len(newborns)
+                ) >= capacity:
+                    continue
+
+                child = organism.reproduce(
+                    self.mutation_strength,
+                    planet=self.planet,
+                    population_ratio=population_ratio,
+                    approved=True,
+                )
+
+                if child:
+                    newborns.append(
+                        child
+                    )
+
+                    self.births += 1
+
+                    self._log(
+                        f"РОЖДЕНИЕ #{child.id} ← "
+                        f"#{organism.id}, поколение "
+                        f"{child.generation}"
+                    )
+
+        deaths_now = sum(
+            1
+            for o in alive_before
+            if not o.alive
+        )
+
+        self.deaths += deaths_now
+
+        for organism in alive_before:
+            if not organism.alive:
+                self._log(
+                    f"СМЕРТЬ #{organism.id}, "
+                    f"возраст {organism.age}, "
+                    f"E={organism.energy:.2f} "
+                    f"W={organism.hydration:.2f} "
+                    f"H={organism.health:.2f}"
+                )
+
+        self.population.extend(
+            newborns
+        )
+
+        alive_population = [
+            o
+            for o in self.population
+            if o.alive
+        ]
+
+        # 420 — только техническая страховка.
+        if (
+            len(alive_population)
+            > MAX_POP
+        ):
+            alive_population.sort(
+                key=lambda o: (
+                    o.health * 0.45
+                    + o.energy * 0.35
+                    + o.hydration * 0.20
+                ),
+                reverse=True
+            )
+
+            self.population = (
+                alive_population[:MAX_POP]
+            )
+
+        else:
+            self.population = (
+                alive_population
+            )
+
+        self.planet.step(
+            population_pressure=population_ratio
+        )
+
+        if self.planet.event:
+            self._log(
+                self.planet.event
+            )
+
+        self.tick += 1
+
+        alive = [
+            o
+            for o in self.population
+            if o.alive
+        ]
+
+        if alive:
+            self.max_generation = max(
+                o.generation
+                for o in alive
+            )
+
+            avg_energy = (
+                sum(
+                    o.energy
+                    for o in alive
+                )
+                / len(alive)
+            )
+
+            avg_health = (
+                sum(
+                    o.health
+                    for o in alive
+                )
+                / len(alive)
+            )
+
+            power = clamp(
+                avg_energy * 0.55
+                + avg_health * 0.45
+            )
+
+            efficiency = clamp(
+                total_efficiency
+                / max(
+                    1,
+                    len(alive)
+                )
+            )
+
+            latency = (
+                total_latency
+                / max(
+                    1,
+                    len(alive)
+                )
+            )
+
+        else:
+            power = 0.0
+            efficiency = 0.0
+            latency = 0.0
+
+        self.history.append({
+            "tick": self.tick,
+            "population": len(alive),
+            "generation": self.max_generation,
+            "capacity": self.carrying_capacity(),
+            "power": power,
+            "efficiency": efficiency,
+            "entropy": self.entropy(),
+            "latency": latency,
+            "diversity": self.behavioral_diversity(),
+            "temperature": self.planet.temperature,
+            "water": self.planet.water,
+            "resources": self.planet.resources,
+            "radiation": self.planet.radiation,
+        })
+
+        self.history = (
+            self.history[-360:]
+        )
+
+        if self.tick % 100 == 0:
+            self._log(
+                f"КОНТРОЛЬНАЯ ТОЧКА: "
+                f"популяция {len(alive)}, "
+                f"ёмкость "
+                f"{self.carrying_capacity()}, "
+                f"поколение "
+                f"{self.max_generation}, "
+                f"энтропия "
+                f"{self.entropy():.2f}"
+            )
+
+        if not alive:
+            self.after_snapshot = (
+                self.snapshot("КОНЕЦ")
+            )
+
+        elif self.tick % 500 == 0:
+            self.after_snapshot = (
+                self.snapshot("КОНЕЦ")
+            )
+
+        if (
+            self.selected_id
+            and not any(
+                o.id == self.selected_id
+                for o in alive
+            )
+        ):
+            self.selected_id = (
+                alive[0].id
+                if alive
+                else None
+            )
+
+        self.last_decision = None
+
+        selected = self.get_selected()
+
+        if selected:
+            self.last_decision = (
+                selected.last_decision
+            )
+
+    def get_selected(self):
+        for organism in self.population:
+            if (
+                organism.id
+                == self.selected_id
+                and organism.alive
+            ):
+                return organism
+
+        return None
+
+    def export(self, filename):
+        data = {
+            "проект": "ASTRA V4",
+            "объект": "Планета A-17",
+            "тик": self.tick,
+            "настройки": self.settings,
+            "параметры_эволюции": {
+                "сила_мутации": self.mutation_strength,
+                "начальная_популяция": self.initial_population,
+            },
+            "планета": {
+                "температура": self.planet.temperature,
+                "вода": self.planet.water,
+                "радиация": self.planet.radiation,
+                "ресурсы": self.planet.resources,
+                "энергия": self.planet.energy,
+                "стабильность": self.planet.stability,
+                "солнечная_активность": self.planet.solar_activity,
+            },
+            "популяция": [],
+            "история": self.history,
+            "начальный_снимок": self.before_snapshot,
+            "финальный_снимок": self.after_snapshot,
+            "журнал": self.journal,
+        }
+
+        for organism in self.population:
+            data["популяция"].append({
+                "id": organism.id,
+                "родитель": organism.parent_id,
+                "поколение": organism.generation,
+                "x": organism.x,
+                "y": organism.y,
+                "возраст": organism.age,
+                "энергия": organism.energy,
+                "вода": organism.hydration,
+                "здоровье": organism.health,
+                "память": organism.memory,
+                "последнее_действие": organism.last_action,
+                "потомков": organism.children,
+                "жива": organism.alive,
+                "геном": organism.genome.values,
+            })
+
+        with open(
+            filename,
+            "w",
+            encoding="utf-8"
+        ) as file:
+            json.dump(
+                data,
+                file,
+                ensure_ascii=False,
+                indent=2
+            )
+
+
+class ScrollableFrame(ttk.Frame):
+    def __init__(self, parent):
+        super().__init__(parent)
+
+        self.canvas = tk.Canvas(
+            self,
+            highlightthickness=0,
+            bg="#101720"
+        )
+
+        self.scrollbar = ttk.Scrollbar(
+            self,
+            orient="vertical",
+            style="Vertical.TScrollbar",
+            command=self.canvas.yview
+        )
+
+        self.content = tk.Frame(
+            self.canvas,
+            bg="#101720"
+        )
+
+        self.window_id = (
+            self.canvas.create_window(
+                (0, 0),
+                window=self.content,
+                anchor="nw"
+            )
+        )
+
+        self.canvas.configure(
+            yscrollcommand=self.scrollbar.set
+        )
+
+        self.canvas.pack(
+            side="left",
+            fill="both",
+            expand=True
+        )
+
+        self.scrollbar.pack(
+            side="right",
+            fill="y"
+        )
+
+        self.content.bind(
+            "<Configure>",
+            self._on_content
+        )
+
+        self.canvas.bind(
+            "<Configure>",
+            self._on_canvas
+        )
+
+        self._bind_wheel(
+            self.canvas
+        )
+
+        self._bind_wheel(
+            self.content
+        )
+
+    def _on_content(self, _event):
+        self.canvas.configure(
+            scrollregion=self.canvas.bbox("all")
+        )
+
+    def _on_canvas(self, event):
+        self.canvas.itemconfigure(
+            self.window_id,
+            width=event.width
+        )
+
+    def _wheel(self, event):
+        if getattr(
+            event,
+            "num",
+            None
+        ) == 4:
+            self.canvas.yview_scroll(
+                -3,
+                "units"
+            )
+
+        elif getattr(
+            event,
+            "num",
+            None
+        ) == 5:
+            self.canvas.yview_scroll(
+                3,
+                "units"
+            )
+
+        else:
+            delta = getattr(
+                event,
+                "delta",
+                0
+            )
+
+            if delta:
+                self.canvas.yview_scroll(
+                    int(
+                        -delta / 120
+                    )
+                    or (
+                        -1
+                        if delta > 0
+                        else 1
+                    ),
+                    "units"
+                )
+
+    def _bind_wheel(self, widget):
+        widget.bind(
+            "<MouseWheel>",
+            self._wheel,
+            add="+"
+        )
+
+        widget.bind(
+            "<Button-4>",
+            self._wheel,
+            add="+"
+        )
+
+        widget.bind(
+            "<Button-5>",
+            self._wheel,
+            add="+"
+        )
+
+
+class AstraApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+
+        self.title(
+            "ASTRA V4 — Планета A-17"
+        )
+
+        self.geometry(
+            f"{WINDOW_W}x{WINDOW_H}"
+        )
+
+        self.minsize(
+            MIN_W,
+            MIN_H
+        )
+
+        self.configure(
+            bg="#0a0f14"
+        )
+
+        self.settings = (
+            Simulation.default_settings()
+        )
+
+        self.sim = Simulation(
+            self.settings
+        )
+
+        self.running = False
+        self.speed = 2
+
+        self._last_clicked_cell = None
+        self._cell_cycle_index = 0
+
+        self._build_styles()
+        self._build_variables()
+        self._build_ui()
+
+        self._render()
+
+        self.after(
+            TICK_MS,
+            self._loop
+        )
+
+    def _build_styles(self):
+        style = ttk.Style(self)
+
+        try:
+            style.theme_use(
+                "clam"
+            )
+        except tk.TclError:
+            pass
+
+        style.configure(
+            "TButton",
+            padding=7,
+            background="#1a2530",
+            foreground="#e0ebf2",
+        )
+
+        style.map(
+            "TButton",
+            background=[
+                (
+                    "active",
+                    "#243544"
+                )
+            ],
+        )
+
+        style.configure(
+            "Vertical.TScrollbar",
+            troughcolor="#111a22",
+            background="#516b7a",
+            arrowcolor="#d7e8f0",
+            borderwidth=0,
+            width=16,
+        )
+
+        style.configure(
+            "TNotebook",
+            background="#101720",
+            borderwidth=0,
+        )
+
+        style.configure(
+            "TNotebook.Tab",
+            padding=(10, 6),
+            background="#17212a",
+            foreground="#b9cedb",
+        )
+
+        style.map(
+            "TNotebook.Tab",
+            background=[
+                (
+                    "selected",
+                    "#243544"
+                )
+            ],
+            foreground=[
+                (
+                    "selected",
+                    "#ffffff"
+                )
+            ],
+        )
+
+    def _build_variables(self):
+        self.vars = {
+            "temperature": tk.DoubleVar(
+                value=percent(
+                    self.settings[
+                        "temperature"
+                    ]
+                )
+            ),
+
+            "water": tk.DoubleVar(
+                value=percent(
+                    self.settings[
+                        "water"
+                    ]
+                )
+            ),
+
+            "resources": tk.DoubleVar(
+                value=percent(
+                    self.settings[
+                        "resources"
+                    ]
+                )
+            ),
+
+            "radiation": tk.DoubleVar(
+                value=percent(
+                    self.settings[
+                        "radiation"
+                    ]
+                )
+            ),
+
+            "energy": tk.DoubleVar(
+                value=percent(
+                    self.settings[
+                        "energy"
+                    ]
+                )
+            ),
+
+            "stability": tk.DoubleVar(
+                value=percent(
+                    self.settings[
+                        "stability"
+                    ]
+                )
+            ),
+
+            "solar_activity": tk.DoubleVar(
+                value=percent(
+                    self.settings[
+                        "solar_activity"
+                    ]
+                )
+            ),
+
+            "mutation_strength": tk.DoubleVar(
+                value=(
+                    self.settings[
+                        "mutation_strength"
+                    ] * 100
+                )
+            ),
+
+            "initial_population": tk.DoubleVar(
+                value=self.settings[
+                    "initial_population"
+                ]
+            ),
+
+            "speed": tk.DoubleVar(
+                value=2
+            ),
+        }
+
+        self.value_labels = {}
+
+    def _panel(self, parent, title):
+        frame = tk.LabelFrame(
+            parent,
+            text=title,
+            fg="#8faaba",
+            bg="#101720",
+            bd=1,
+            relief="groove",
+            font=(
+                "Segoe UI",
+                9,
+                "bold"
+            ),
+            padx=10,
+            pady=9,
+        )
+
+        frame.pack(
+            fill="x",
+            padx=8,
+            pady=7
+        )
+
+        return frame
+
+    def _slider(
+        self,
+        parent,
+        key,
+        title,
+        maximum=100,
+        resolution=1,
+        suffix="%"
+    ):
+        row = tk.Frame(
+            parent,
+            bg="#101720"
+        )
+
+        row.pack(
+            fill="x",
+            pady=5
+        )
+
+        top = tk.Frame(
+            row,
+            bg="#101720"
+        )
+
+        top.pack(
+            fill="x"
+        )
+
+        tk.Label(
+            top,
+            text=title,
+            fg="#c5d6df",
+            bg="#101720",
+            font=(
+                "Segoe UI",
+                10
+            )
+        ).pack(
+            side="left"
+        )
+
+        label = tk.Label(
+            top,
+            text="",
+            fg="#79c6df",
+            bg="#101720",
+            font=(
+                "Consolas",
+                9,
+                "bold"
+            )
+        )
+
+        label.pack(
+            side="right"
+        )
+
+        self.value_labels[
+            key
+        ] = (
+            label,
+            suffix
+        )
+
+        scale = tk.Scale(
+            row,
+            from_=0,
+            to=maximum,
+            resolution=resolution,
+            orient="horizontal",
+            variable=self.vars[key],
+            command=lambda value, k=key:
+                self._update_slider_label(
+                    k,
+                    value
+                ),
+            showvalue=False,
+            highlightthickness=1,
+            highlightbackground="#263743",
+            highlightcolor="#79c6df",
+            bd=1,
+            relief="flat",
+            bg="#101720",
+            fg="#d9e6ee",
+            troughcolor="#40535f",
+            activebackground="#d7f4ff",
+            sliderrelief="raised",
+            sliderlength=26,
+            width=18,
+            cursor="hand2",
+            length=285,
+        )
+
+        scale.pack(
+            fill="x",
+            pady=(2, 0)
+        )
+
+        self._update_slider_label(
+            key,
+            self.vars[key].get()
+        )
+
+    def _update_slider_label(
+        self,
+        key,
+        value
+    ):
+        if key not in self.value_labels:
+            return
+
+        label, suffix = (
+            self.value_labels[key]
+        )
+
+        if key == "mutation_strength":
+            label.config(
+                text=f"{float(value):.1f}%"
+            )
+
+        elif key == "initial_population":
+            label.config(
+                text=f"{int(float(value))}"
+            )
+
+        else:
+            label.config(
+                text=(
+                    f"{int(round(float(value)))}"
+                    f"{suffix}"
+                )
+            )
+
+    def _build_ui(self):
+        # Шапка.
+        header = tk.Frame(
+            self,
+            bg="#111922",
+            height=66
+        )
+
+        header.pack(
+            fill="x"
+        )
+
+        tk.Label(
+            header,
+            text="ASTRA V4",
+            fg="#eef8ff",
+            bg="#111922",
+            font=(
+                "Segoe UI",
+                24,
+                "bold"
+            )
+        ).pack(
+            side="left",
+            padx=(16, 10),
+            pady=8
+        )
+
+        tk.Label(
+            header,
+            text=(
+                "ПЛАНЕТА A-17 • "
+                "ЛАБОРАТОРИЯ ВОЗНИКНОВЕНИЯ ВЫБОРА"
+            ),
+            fg="#8daabb",
+            bg="#111922",
+            font=(
+                "Segoe UI",
+                11,
+                "bold"
+            )
+        ).pack(
+            side="left",
+            pady=10
+        )
+
+        self.status_label = tk.Label(
+            header,
+            text="ПАУЗА",
+            fg="#ffd27a",
+            bg="#111922",
+            font=(
+                "Consolas",
+                10,
+                "bold"
+            )
+        )
+
+        self.status_label.pack(
+            side="right",
+            padx=16
+        )
+
+        main = tk.Frame(
+            self,
+            bg="#0a0f14"
+        )
+
+        main.pack(
+            fill="both",
+            expand=True,
+            padx=9,
+            pady=9
+        )
+
+        # ----------------------------------------------------
+        # ЛЕВАЯ КОЛОНКА
+        # ----------------------------------------------------
+        left = tk.Frame(
+            main,
+            bg="#101720",
+            width=410
+        )
+
+        left.pack(
+            side="left",
+            fill="y"
+        )
+
+        left.pack_propagate(
+            False
+        )
+
+        scroll = ScrollableFrame(
+            left
+        )
+
+        scroll.pack(
+            fill="both",
+            expand=True
+        )
+
+        controls = scroll.content
+
+        tk.Label(
+            controls,
+            text=(
+                "ПРОКРУТИТЕ ПАНЕЛЬ, "
+                "ЧТОБЫ УВИДЕТЬ ВСЕ НАСТРОЙКИ"
+            ),
+            fg="#d7e8f0",
+            bg="#101720",
+            font=(
+                "Segoe UI",
+                9,
+                "bold"
+            ),
+            wraplength=360,
+            justify="left"
+        ).pack(
+            fill="x",
+            padx=10,
+            pady=(10, 4)
+        )
+
+        self._build_planet_panel(
+            controls
+        )
+
+        self._build_simulation_panel(
+            controls
+        )
+
+        self._build_event_panel(
+            controls
+        )
+
+        # ----------------------------------------------------
+        # ЦЕНТР
+        # ----------------------------------------------------
+        center = tk.Frame(
+            main,
+            bg="#0a0f14"
+        )
+
+        center.pack(
+            side="left",
+            fill="both",
+            expand=True,
+            padx=8
+        )
+
+        map_frame = tk.LabelFrame(
+            center,
+            text="КАРТА ПЛАНЕТЫ A-17",
+            fg="#8faaba",
+            bg="#101720",
+            bd=1,
+            relief="groove",
+            font=(
+                "Segoe UI",
+                9,
+                "bold"
+            )
+        )
+
+        map_frame.pack(
+            fill="both",
+            expand=True
+        )
+
+        map_top = tk.Frame(
+            map_frame,
+            bg="#101720"
+        )
+
+        map_top.pack(
+            fill="x",
+            padx=8,
+            pady=(5, 0)
+        )
+
+        self.map_status_label = tk.Label(
+            map_top,
+            text=(
+                "Кликните по сущности ●, "
+                "чтобы открыть её состояние. "
+                "Наведение показывает состояние клетки."
+            ),
+            fg="#91aebb",
+            bg="#101720",
+            font=(
+                "Segoe UI",
+                9
+            ),
+            anchor="w"
+        )
+
+        self.map_status_label.pack(
+            side="left",
+            fill="x",
+            expand=True
+        )
+
+        self.world_canvas = tk.Canvas(
+            map_frame,
+            bg="#060a0e",
+            highlightthickness=0
+        )
+
+        self.world_canvas.pack(
+            fill="both",
+            expand=True,
+            padx=5,
+            pady=4
+        )
+
+        self.world_canvas.bind(
+            "<Button-1>",
+            self._select_from_world
+        )
+
+        self.world_canvas.bind(
+            "<Motion>",
+            self._map_hover
+        )
+
+        self.world_canvas.bind(
+            "<Leave>",
+            lambda _event:
+                self._map_leave()
+        )
+
+        legend_frame = tk.Frame(
+            map_frame,
+            bg="#0c131a"
+        )
+
+        legend_frame.pack(
+            fill="x",
+            padx=5,
+            pady=(0, 5)
+        )
+
+        self._build_map_legend(
+            legend_frame
+        )
+
+        graph_frame = tk.LabelFrame(
+            center,
+            text="ДИНАМИКА ЭКСПЕРИМЕНТА",
+            fg="#8faaba",
+            bg="#101720",
+            bd=1,
+            relief="groove",
+            font=(
+                "Segoe UI",
+                9,
+                "bold"
+            ),
+            height=190
+        )
+
+        graph_frame.pack(
+            fill="x",
+            pady=(8, 0)
+        )
+
+        graph_frame.pack_propagate(
+            False
+        )
+
+        self.chart_canvas = tk.Canvas(
+            graph_frame,
+            bg="#090e13",
+            highlightthickness=0
+        )
+
+        self.chart_canvas.pack(
+            fill="both",
+            expand=True,
+            padx=5,
+            pady=5
+        )
+
+        # ----------------------------------------------------
+        # ПРАВАЯ КОЛОНКА
+        # ----------------------------------------------------
+        right = tk.Frame(
+            main,
+            bg="#101720",
+            width=410
+        )
+
+        right.pack(
+            side="right",
+            fill="y"
+        )
+
+        right.pack_propagate(
+            False
+        )
+
+        notebook = ttk.Notebook(
+            right
+        )
+
+        notebook.pack(
+            fill="both",
+            expand=True,
+            padx=6,
+            pady=6
+        )
+
+        self.org_tab = tk.Frame(
+            notebook,
+            bg="#101720"
+        )
+
+        self.decision_tab = tk.Frame(
+            notebook,
+            bg="#101720"
+        )
+
+        self.analytics_tab = tk.Frame(
+            notebook,
+            bg="#101720"
+        )
+
+        self.log_tab = tk.Frame(
+            notebook,
+            bg="#101720"
+        )
+
+        self.help_tab = tk.Frame(
+            notebook,
+            bg="#101720"
+        )
+
+        notebook.add(
+            self.org_tab,
+            text="СУЩНОСТЬ"
+        )
+
+        notebook.add(
+            self.decision_tab,
+            text="ВЫБОР"
+        )
+
+        notebook.add(
+            self.analytics_tab,
+            text="АНАЛИТИКА"
+        )
+
+        notebook.add(
+            self.log_tab,
+            text="ЖУРНАЛ"
+        )
+
+        notebook.add(
+            self.help_tab,
+            text="СПРАВКА"
+        )
+
+        self.org_text = self._text_box(
+            self.org_tab
+        )
+
+        self.decision_text = self._text_box(
+            self.decision_tab
+        )
+
+        self.analytics_text = self._text_box(
+            self.analytics_tab
+        )
+
+        self.log_text = self._text_box(
+            self.log_tab
+        )
+
+        self._build_help_tab(
+            self.help_tab
+        )
+
+    def _build_help_tab(self, parent):
+        """Встроенная документация ASTRA."""
+        frame = tk.Frame(
+            parent,
+            bg="#101720"
+        )
+
+        frame.pack(
+            fill="both",
+            expand=True,
+            padx=8,
+            pady=8
+        )
+
+        scrollbar = ttk.Scrollbar(
+            frame,
+            orient="vertical"
+        )
+
+        scrollbar.pack(
+            side="right",
+            fill="y"
+        )
+
+        text = tk.Text(
+            frame,
+            bg="#0b1117",
+            fg="#d3e2e9",
+            insertbackground="#ffffff",
+            relief="flat",
+            bd=0,
+            font=(
+                "Segoe UI",
+                10
+            ),
+            wrap="word",
+            padx=14,
+            pady=14,
+            yscrollcommand=scrollbar.set,
+        )
+
+        text.pack(
+            side="left",
+            fill="both",
+            expand=True
+        )
+
+        scrollbar.config(
+            command=text.yview
+        )
+
+        text.tag_configure(
+            "title",
+            font=(
+                "Segoe UI",
+                14,
+                "bold"
+            ),
+            foreground="#eaf6ff",
+            spacing3=8
+        )
+
+        text.tag_configure(
+            "section",
+            font=(
+                "Segoe UI",
+                11,
+                "bold"
+            ),
+            foreground="#79c6df",
+            spacing1=8,
+            spacing3=4
+        )
+
+        text.tag_configure(
+            "important",
+            font=(
+                "Segoe UI",
+                10,
+                "bold"
+            ),
+            foreground="#ffd27a"
+        )
+
+        text.tag_configure(
+            "code",
+            font=(
+                "Consolas",
+                9
+            ),
+            foreground="#b7d5e2",
+            lmargin1=12,
+            lmargin2=12
+        )
+
+        text.tag_configure(
+            "muted",
+            foreground="#8da6b3"
+        )
+
+        def add(value="", tag=None):
+            text.insert(
+                "end",
+                value + "\n",
+                tag
+            )
+
+        add(
+            "СПРАВКА ASTRA",
+            "title"
+        )
+
+        add(
+            "Что означают параметры, "
+            "проценты и действия системы",
+            "muted"
+        )
+
+        add("")
+
+        add(
+            "1. КАК ЧИТАТЬ ПРОЦЕНТЫ",
+            "section"
+        )
+
+        add(
+            "Все параметры планеты на панели — "
+            "это НОРМАЛИЗОВАННАЯ ШКАЛА от 0 до 100%. "
+            "Это не реальные физические единицы. "
+            "Например, 24% температуры не означает 24 °C. "
+            "Это уровень температурного фактора "
+            "в математической модели."
+        )
+
+        add(
+            "Пример: 24% → 0.24 внутри расчётов; "
+            "80% → 0.80.",
+            "code"
+        )
+
+        add(
+            "Процент не означает «на столько процентов "
+            "изменится результат». "
+            "Каждый параметр входит в разные формулы "
+            "с разными весами, поэтому влияние может "
+            "быть нелинейным.",
+            "important"
+        )
+
+        add(
+            "2. ПАРАМЕТРЫ ПЛАНЕТЫ",
+            "section"
+        )
+
+        add(
+            "Температура — общий температурный фактор. "
+            "Он смешивается с температурой локальных клеток карты. "
+            "Высокая локальная температура увеличивает расход "
+            "гидратации организма и повышает привлекательность "
+            "действия «Укрыться»."
+        )
+
+        add(
+            "Вода — глобальная доступность воды. "
+            "Она влияет на локальные клетки карты, "
+            "а локальный дефицит воды повышает оценку "
+            "действия «Искать воду». "
+            "Чем ниже гидратация организма, тем сильнее "
+            "его потребность искать воду."
+        )
+
+        add(
+            "Ресурсы — глобальная доступность ресурсов. "
+            "Через локальные клетки влияет на доступный запас. "
+            "Дефицит ресурсов и низкая энергия организма "
+            "увеличивают оценку действия «Искать ресурсы»."
+        )
+
+        add(
+            "Радиация — уровень радиационного риска. "
+            "Она смешивается с локальной радиацией, "
+            "влияет на показатель опасности, уменьшает здоровье "
+            "организма и делает «Укрыться» более привлекательным."
+        )
+
+        add(
+            "Доступная энергия — ресурсный коэффициент планеты. "
+            "Он влияет на количество энергии, которое организм "
+            "получает из найденных ресурсов, а также на "
+            "экологическую ёмкость и возможность устойчивого "
+            "воспроизводства.",
+            "important"
+        )
+
+        add(
+            "Стабильность — влияет на привлекательность "
+            "исследования: чем выше стабильность, тем выше "
+            "базовая оценка действия «Исследовать»."
+        )
+
+        add(
+            "Солнечная активность — постепенно увеличивает "
+            "глобальную радиацию. При солнечной буре "
+            "она также усиливается, а радиация и стабильность "
+            "меняются сильнее."
+        )
+
+        add(
+            "3. ПОЧЕМУ ВЛИЯНИЕ НЕ ЛИНЕЙНОЕ",
+            "section"
+        )
+
+        add(
+            "Например, для поиска воды используется идея:",
+            "muted"
+        )
+
+        add(
+            "оценка = вес_поиска_воды × "
+            "(0.35 + дефицит_воды_организма × 1.4 "
+            "+ дефицит_воды_клетки)",
+            "code"
+        )
+
+        add(
+            "Итог зависит одновременно от генома организма, "
+            "его гидратации и состояния конкретной клетки. "
+            "Поэтому изменение воды с 50% до 60% не означает "
+            "автоматически +10% к вероятности выбора."
+        )
+
+        add(
+            "4. ПАРАМЕТРЫ СИСТЕМЫ",
+            "section"
+        )
+
+        add(
+            "Сила мутации — величина разброса при создании потомка. "
+            "Например, 5.5% означает, что каждый наследуемый "
+            "параметр получает случайное изменение "
+            "с характерным масштабом 0.055. "
+            "Это не фиксированное «прибавить 5.5%» — "
+            "знак и размер изменения случайны."
+        )
+
+        add(
+            "Начальная популяция — сколько организмов создаётся "
+            "при старте или перезапуске эксперимента. "
+            "420 — технический абсолютный предел, "
+            "но реальная экологическая ёмкость рассчитывается "
+            "отдельно и обычно ниже."
+        )
+
+        add(
+            "Скорость симуляции — параметр интерфейса. "
+            "Она определяет, сколько шагов движка выполняется "
+            "за один цикл обновления окна. "
+            "Она не меняет формулы."
+        )
+
+        add(
+            "5. КАК ФОРМИРУЕТСЯ РЕШЕНИЕ",
+            "section"
+        )
+
+        add(
+            "Каждый живой организм оценивает все 6 действий: "
+            "найти ресурсы, найти воду, укрыться, исследовать, "
+            "отдыхать, воспроизвестись. "
+            "Побеждает действие с максимальной рассчитанной оценкой."
+        )
+
+        add(
+            "Среда + состояние организма + геном + память "
+            "→ оценки альтернатив → выбранное действие",
+            "code"
+        )
+
+        add(
+            "Память дополнительно может изменить оценку "
+            "последнего действия через последнее вознаграждение. "
+            "После действия результат влияет на память, "
+            "скорость адаптации и риск."
+        )
+
+        add(
+            "6. АДАПТАЦИЯ, РАЗМНОЖЕНИЕ И ЭВОЛЮЦИЯ",
+            "section"
+        )
+
+        add(
+            "Адаптация происходит в течение жизни организма: "
+            "небольшие изменения параметров поведения зависят "
+            "от результата действия. Размножение возможно "
+            "только после созревания, при достаточных запасах "
+            "энергии, воды и здоровья, в пригодной среде "
+            "и пока популяция не приблизилась к экологической ёмкости. "
+            "После рождения действует период восстановления. "
+            "Потомок получает геном родителя с мутацией."
+        )
+
+        add(
+            "жизненный опыт → адаптация; "
+            "наследование + мутация + отбор → эволюция",
+            "code"
+        )
+
+        add(
+            "7. КАТАСТРОФЫ",
+            "section"
+        )
+
+        add(
+            "Солнечная буря повышает солнечную активность "
+            "и радиацию, снижает стабильность и повреждает "
+            "часть клеток."
+        )
+
+        add(
+            "Смещение климата изменяет температуру, воду "
+            "и стабильность планеты, а также меняет "
+            "локальные условия клеток."
+        )
+
+        add(
+            "8. ЧТО ВИДНО НА КАРТЕ",
+            "section"
+        )
+
+        add(
+            "О — оазис; П — пустыня; Л — ледник; "
+            "А — аномалия; ● — живая сущность. "
+            "На клетке: нижняя полоса = ресурсы, "
+            "верхняя = вода, вертикальная = радиация. "
+            "Цвет точки показывает последнее действие.",
+            "code"
+        )
+
+        add(
+            "Нажав на ●, можно выбрать организм и посмотреть "
+            "его состояние, геном и последнее решение. "
+            "Карта показывает пространство, в котором "
+            "происходит эксперимент."
+        )
+
+        add(
+            "9. МЕТРИКИ",
+            "section"
+        )
+
+        add(
+            "Мощность — сводный показатель текущей энергии "
+            "и здоровья живой популяции."
+        )
+
+        add(
+            "Эффективность — показатель полезного результата "
+            "действий относительно состояния популяции."
+        )
+
+        add(
+            "Энтропия — разнообразие распределения действий "
+            "внутри популяции в текущий момент."
+        )
+
+        add(
+            "Задержка решения — модельная оценка стоимости "
+            "или сложности принятия решения, а не измерение "
+            "реального времени CPU."
+        )
+
+        add(
+            "Разнообразие поведения — средняя разница "
+            "между геномами организмов."
+        )
+
+        add(
+            "Экологическая ёмкость — оценка того, "
+            "сколько живых организмов текущая среда способна "
+            "устойчиво поддерживать. Она рассчитывается "
+            "из ресурсов, воды, радиации, стабильности, "
+            "энергии и температурной пригодности. "
+            "Технический предел 420 выше обычной "
+            "экологической ёмкости."
+        )
+
+        add(
+            "10. УПРОЩЁННАЯ СХЕМА ASTRA",
+            "section"
+        )
+
+        add(
+            "ФИЗИЧЕСКАЯ СРЕДА",
+            "code"
+        )
+
+        add(
+            "        ↓",
+            "code"
+        )
+
+        add(
+            "СОСТОЯНИЕ ЛОКАЛЬНОЙ ЗОНЫ "
+            "+ СОСТОЯНИЕ ОРГАНИЗМА",
+            "code"
+        )
+
+        add(
+            "        ↓",
+            "code"
+        )
+
+        add(
+            "ОЦЕНКА АЛЬТЕРНАТИВ",
+            "code"
+        )
+
+        add(
+            "        ↓",
+            "code"
+        )
+
+        add(
+            "ВЫБОР ДЕЙСТВИЯ",
+            "code"
+        )
+
+        add(
+            "        ↓",
+            "code"
+        )
+
+        add(
+            "РЕЗУЛЬТАТ → ПАМЯТЬ / АДАПТАЦИЯ",
+            "code"
+        )
+
+        add(
+            "        ↓",
+            "code"
+        )
+
+        add(
+            "РАЗМНОЖЕНИЕ → МУТАЦИЯ "
+            "→ НОВОЕ ПОКОЛЕНИЕ",
+            "code"
+        )
+
+        add(
+            "        ↓",
+            "code"
+        )
+
+        add(
+            "ПОПУЛЯЦИЯ ИЗМЕНЯЕТ СРЕДУ",
+            "code"
+        )
+
+        add(
+            "        ↺",
+            "code"
+        )
+
+        add(
+            "Важно: ASTRA — математическая экспериментальная "
+            "модель. Проценты и метрики интерпретируются "
+            "внутри модели и не являются прямыми физическими "
+            "измерениями реальной планеты.",
+            "important"
+        )
+
+        text.configure(
+            state="disabled"
+        )
+
+    def _build_planet_panel(self, parent):
+        planet = self._panel(
+            parent,
+            "ПАРАМЕТРЫ ПЛАНЕТЫ"
+        )
+
+        self._slider(
+            planet,
+            "temperature",
+            "Температура"
+        )
+
+        self._slider(
+            planet,
+            "water",
+            "Вода"
+        )
+
+        self._slider(
+            planet,
+            "resources",
+            "Ресурсы"
+        )
+
+        self._slider(
+            planet,
+            "radiation",
+            "Радиация"
+        )
+
+        self._slider(
+            planet,
+            "energy",
+            "Доступная энергия"
+        )
+
+        self._slider(
+            planet,
+            "stability",
+            "Стабильность"
+        )
+
+        self._slider(
+            planet,
+            "solar_activity",
+            "Солнечная активность"
+        )
+
+        ttk.Button(
+            planet,
+            text="ПРИМЕНИТЬ К ПЛАНЕТЕ",
+            command=self._apply_live_parameters
+        ).pack(
+            fill="x",
+            pady=(6, 3)
+        )
+
+        ttk.Button(
+            planet,
+            text="ПРИМЕНИТЬ И НАЧАТЬ ЗАНОВО",
+            command=self._apply_and_reset
+        ).pack(
+            fill="x",
+            pady=3
+        )
+
+    def _build_simulation_panel(
+        self,
+        parent
+    ):
+        sim = self._panel(
+            parent,
+            "ПАРАМЕТРЫ СИСТЕМЫ"
+        )
+
+        self._slider(
+            sim,
+            "mutation_strength",
+            "Сила мутации",
+            maximum=20,
+            resolution=0.5
+        )
+
+        self._slider(
+            sim,
+            "initial_population",
+            "Начальная популяция",
+            maximum=200,
+            resolution=1,
+            suffix=""
+        )
+
+        self._slider(
+            sim,
+            "speed",
+            "Скорость симуляции",
+            maximum=10,
+            resolution=1,
+            suffix="×"
+        )
+
+        buttons = tk.Frame(
+            sim,
+            bg="#101720"
+        )
+
+        buttons.pack(
+            fill="x",
+            pady=(5, 0)
+        )
+
+        ttk.Button(
+            buttons,
+            text="▶ ЗАПУСК",
+            command=self.start
+        ).pack(
+            side="left",
+            fill="x",
+            expand=True,
+            padx=(0, 3)
+        )
+
+        ttk.Button(
+            buttons,
+            text="Ⅱ ПАУЗА",
+            command=self.pause
+        ).pack(
+            side="left",
+            fill="x",
+            expand=True,
+            padx=(3, 0)
+        )
+
+        ttk.Button(
+            sim,
+            text="⏭ ОДИН ШАГ",
+            command=self.step_once
+        ).pack(
+            fill="x",
+            pady=3
+        )
+
+        row = tk.Frame(
+            sim,
+            bg="#101720"
+        )
+
+        row.pack(
+            fill="x"
+        )
+
+        ttk.Button(
+            row,
+            text="⟳ НОВЫЙ ЭКСПЕРИМЕНТ",
+            command=self.reset
+        ).pack(
+            side="left",
+            fill="x",
+            expand=True,
+            padx=(0, 3)
+        )
+
+        ttk.Button(
+            row,
+            text="💾 ЭКСПОРТ",
+            command=self.export
+        ).pack(
+            side="left",
+            fill="x",
+            expand=True,
+            padx=(3, 0)
+        )
+
+        events = tk.Frame(
+            sim,
+            bg="#101720"
+        )
+
+        events.pack(
+            fill="x",
+            pady=(6, 0)
+        )
+
+        ttk.Button(
+            events,
+            text="☀ СОЛНЕЧНАЯ БУРЯ",
+            command=self.storm
+        ).pack(
+            side="left",
+            fill="x",
+            expand=True,
+            padx=(0, 3)
+        )
+
+        ttk.Button(
+            events,
+            text="☄ СМЕЩЕНИЕ КЛИМАТА",
+            command=self.climate
+        ).pack(
+            side="left",
+            fill="x",
+            expand=True,
+            padx=(3, 0)
+        )
+
+    def _build_event_panel(
+        self,
+        parent
+    ):
+        panel = self._panel(
+            parent,
+            "ТЕКУЩЕЕ СОСТОЯНИЕ"
+        )
+
+        self.quick_text = tk.Text(
+            panel,
+            height=8,
+            bg="#0b1117",
+            fg="#b8cbd5",
+            relief="flat",
+            bd=0,
+            font=(
+                "Consolas",
+                9
+            ),
+            wrap="word"
+        )
+
+        self.quick_text.pack(
+            fill="x"
+        )
+
+    def _text_box(
+        self,
+        parent
+    ):
+        text = tk.Text(
+            parent,
+            bg="#0b1117",
+            fg="#cfe0e8",
+            relief="flat",
+            bd=0,
+            font=(
+                "Consolas",
+                9
+            ),
+            wrap="word",
+            padx=10,
+            pady=10
+        )
+
+        text.pack(
+            fill="both",
+            expand=True,
+            padx=6,
+            pady=6
+        )
+
+        return text
+
+    def _settings_from_vars(
+        self
+    ):
+        self.settings.update({
+            "temperature":
+                self.vars[
+                    "temperature"
+                ].get()
+                / 100,
+
+            "water":
+                self.vars[
+                    "water"
+                ].get()
+                / 100,
+
+            "resources":
+                self.vars[
+                    "resources"
+                ].get()
+                / 100,
+
+            "radiation":
+                self.vars[
+                    "radiation"
+                ].get()
+                / 100,
+
+            "energy":
+                self.vars[
+                    "energy"
+                ].get()
+                / 100,
+
+            "stability":
+                self.vars[
+                    "stability"
+                ].get()
+                / 100,
+
+            "solar_activity":
+                self.vars[
+                    "solar_activity"
+                ].get()
+                / 100,
+
+            "mutation_strength":
+                self.vars[
+                    "mutation_strength"
+                ].get()
+                / 100,
+
+            "initial_population":
+                int(
+                    round(
+                        self.vars[
+                            "initial_population"
+                        ].get()
+                    )
+                ),
+        })
+
+        return self.settings
+
+    def _apply_live_parameters(
+        self
+    ):
+        self._settings_from_vars()
+
+        self.sim.mutation_strength = (
+            self.settings[
+                "mutation_strength"
+            ]
+        )
+
+        self.sim.settings = dict(
+            self.settings
+        )
+
+        self.sim.planet.set_parameters(
+            self.settings
+        )
+
+        self.sim._log(
+            "ПАРАМЕТРЫ ПЛАНЕТЫ "
+            "ИЗМЕНЕНЫ ПОЛЬЗОВАТЕЛЕМ"
+        )
+
+        self._render()
+
+    def _apply_and_reset(
+        self
+    ):
+        self._settings_from_vars()
+
+        self.sim = Simulation(
+            self.settings
+        )
+
+        self.speed = int(
+            self.vars[
+                "speed"
+            ].get()
+        )
+
+        self.running = False
+
+        self.status_label.config(
+            text="ПАУЗА",
+            fg="#ffd27a"
+        )
+
+        self._render()
+
+    def start(self):
+        self.running = True
+
+        self.status_label.config(
+            text="СИМУЛЯЦИЯ ИДЁТ",
+            fg="#79e59a"
+        )
+
+    def pause(self):
+        self.running = False
+
+        self.status_label.config(
+            text="ПАУЗА",
+            fg="#ffd27a"
+        )
+
+    def reset(self):
+        self._settings_from_vars()
+
+        self.sim = Simulation(
+            self.settings
+        )
+
+        self.speed = int(
+            self.vars[
+                "speed"
+            ].get()
+        )
+
+        self.running = False
+
+        self.status_label.config(
+            text="ПАУЗА",
+            fg="#ffd27a"
+        )
+
+        self._render()
+
+    def step_once(self):
+        self.sim.step()
+        self._render()
+
+    def storm(self):
+        self.sim.planet.trigger_storm()
+
+        self.sim._log(
+            self.sim.planet.event
+        )
+
+        self._render()
+
+    def climate(self):
+        self.sim.planet.climate_shift()
+
+        self.sim._log(
+            self.sim.planet.event
+        )
+
+        self._render()
+
+    def export(self):
+        filename = filedialog.asksaveasfilename(
+            title="Сохранить эксперимент ASTRA",
+            defaultextension=".json",
+            filetypes=[
+                (
+                    "Файл JSON",
+                    "*.json"
+                )
+            ]
+        )
+
+        if filename:
+            self.sim.export(
+                filename
+            )
+
+            messagebox.showinfo(
+                "ASTRA",
+                "Эксперимент сохранён."
+            )
+
+    def _world_layout(
+        self,
+        width,
+        height
+    ):
+        left_margin = 30
+        top_margin = 28
+        right_margin = 12
+        bottom_margin = 30
+
+        usable_w = max(
+            10,
+            width
+            - left_margin
+            - right_margin
+        )
+
+        usable_h = max(
+            10,
+            height
+            - top_margin
+            - bottom_margin
+        )
+
+        cell_size = max(
+            22,
+            min(
+                60,
+                int(
+                    min(
+                        usable_w / GRID_W,
+                        usable_h / GRID_H
+                    )
+                )
+            )
+        )
+
+        total_w = (
+            GRID_W
+            * cell_size
+        )
+
+        total_h = (
+            GRID_H
+            * cell_size
+        )
+
+        ox = (
+            left_margin
+            + max(
+                0,
+                (
+                    usable_w
+                    - total_w
+                ) / 2
+            )
+        )
+
+        oy = (
+            top_margin
+            + max(
+                0,
+                (
+                    usable_h
+                    - total_h
+                ) / 2
+            )
+        )
+
+        return (
+            cell_size,
+            ox,
+            oy
+        )
+
+    def _cell_from_event(
+        self,
+        event
+    ):
+        cw = max(
+            10,
+            self.world_canvas.winfo_width()
+        )
+
+        ch = max(
+            10,
+            self.world_canvas.winfo_height()
+        )
+
+        cell_size, ox, oy = (
+            self._world_layout(
+                cw,
+                ch
+            )
+        )
+
+        gx = int(
+            (
+                event.x
+                - ox
+            )
+            / cell_size
+        )
+
+        gy = int(
+            (
+                event.y
+                - oy
+            )
+            / cell_size
+        )
+
+        if not (
+            0 <= gx < GRID_W
+            and 0 <= gy < GRID_H
+        ):
+            return None
+
+        return (
+            gx,
+            gy
+        )
+
+    def _select_from_world(
+        self,
+        event
+    ):
+        cell = self._cell_from_event(
+            event
+        )
+
+        if cell is None:
+            return
+
+        gx, gy = cell
+
+        candidates = [
+            o
+            for o in self.sim.population
+            if (
+                o.alive
+                and o.x == gx
+                and o.y == gy
+            )
+        ]
+
+        if not candidates:
+            self._cell_cycle_index = 0
+            self._last_clicked_cell = cell
+
+            self._update_map_status(
+                gx,
+                gy
+            )
+
+            return
+
+        if (
+            self._last_clicked_cell
+            == cell
+        ):
+            self._cell_cycle_index = (
+                self._cell_cycle_index + 1
+            ) % len(candidates)
+
+        else:
+            self._cell_cycle_index = 0
+            self._last_clicked_cell = cell
+
+        selected = candidates[
+            self._cell_cycle_index
+        ]
+
+        self.sim.selected_id = (
+            selected.id
+        )
+
+        self._render()
+
+    def _map_hover(
+        self,
+        event
+    ):
+        cell = self._cell_from_event(
+            event
+        )
+
+        if cell is None:
+            self._map_leave()
+            return
+
+        self._update_map_status(
+            *cell
+        )
+
+    def _map_leave(self):
+        alive = sum(
+            o.alive
+            for o in self.sim.population
+        )
+
+        self.map_status_label.config(
+            text=(
+                f"Планета A-17 • "
+                f"живых: {alive} • "
+                f"ёмкость: "
+                f"{self.sim.carrying_capacity()} • "
+                "цвет точки = последнее действие"
+            )
+        )
+
+    def _update_map_status(
+        self,
+        gx,
+        gy
+    ):
+        cell = self.sim.planet.get_cell(
+            gx,
+            gy
+        )
+
+        entities = [
+            o
+            for o in self.sim.population
+            if (
+                o.alive
+                and o.x == gx
+                and o.y == gy
+            )
+        ]
+
+        entity_text = (
+            f"Сущностей: {len(entities)}"
+            if entities
+            else
+            "Сущностей: нет"
+        )
+
+        self.map_status_label.config(
+            text=(
+                f"Клетка "
+                f"[{gx + 1:02d}:{gy + 1:02d}] • "
+                f"{BIOME_RU[cell.biome]} • "
+                f"вода {percent(cell.water)}% • "
+                f"ресурсы {percent(cell.resources)}% • "
+                f"радиация {percent(cell.radiation)}% • "
+                f"{entity_text}"
+            )
+        )
+
+    def _build_map_legend(
+        self,
+        parent
+    ):
+        tk.Label(
+            parent,
+            text="БИОМЫ",
+            fg="#8faaba",
+            bg="#0c131a",
+            font=(
+                "Segoe UI",
+                8,
+                "bold"
+            )
+        ).pack(
+            side="left",
+            padx=(6, 4)
+        )
+
+        for biome in (
+            "ОАЗИС",
+            "ПУСТЫНЯ",
+            "ЛЕДНИК",
+            "АНОМАЛИЯ"
+        ):
+            item = tk.Frame(
+                parent,
+                bg="#0c131a"
+            )
+
+            item.pack(
+                side="left",
+                padx=5
+            )
+
+            swatch = tk.Frame(
+                item,
+                bg=BIOME_FILL[biome],
+                width=14,
+                height=14
+            )
+
+            swatch.pack(
+                side="left",
+                padx=(0, 3)
+            )
+
+            swatch.pack_propagate(
+                False
+            )
+
+            tk.Label(
+                item,
+                text=BIOME_SHORT[
+                    biome
+                ],
+                fg="#c8d9e2",
+                bg="#0c131a",
+                font=(
+                    "Consolas",
+                    8,
+                    "bold"
+                )
+            ).pack(
+                side="left"
+            )
+
+        tk.Label(
+            parent,
+            text="  •",
+            fg="#6f8591",
+            bg="#0c131a",
+            font=(
+                "Consolas",
+                9,
+                "bold"
+            )
+        ).pack(
+            side="left"
+        )
+
+        tk.Label(
+            parent,
+            text="цвет точки = действие",
+            fg="#a7bac5",
+            bg="#0c131a",
+            font=(
+                "Segoe UI",
+                8
+            )
+        ).pack(
+            side="left",
+            padx=(2, 0)
+        )
+
+        tk.Label(
+            parent,
+            text=(
+                "  |  клик по клетке "
+                "= выбрать сущность"
+            ),
+            fg="#6f8591",
+            bg="#0c131a",
+            font=(
+                "Segoe UI",
+                8
+            )
+        ).pack(
+            side="left"
+        )
+
+    def _draw_world(self):
+        canvas = self.world_canvas
+
+        canvas.delete(
+            "all"
+        )
+
+        cw = max(
+            10,
+            canvas.winfo_width()
+        )
+
+        ch = max(
+            10,
+            canvas.winfo_height()
+        )
+
+        cell_size, ox, oy = (
+            self._world_layout(
+                cw,
+                ch
+            )
+        )
+
+        canvas.create_text(
+            10,
+            7,
+            anchor="nw",
+            text=(
+                f"Тик: {self.sim.tick}   •   "
+                f"поколение: "
+                f"{self.sim.max_generation}   •   "
+                f"популяция: "
+                f"{sum(o.alive for o in self.sim.population)} "
+                f"/ {self.sim.carrying_capacity()}"
+            ),
+            fill="#c8d9e2",
+            font=(
+                "Segoe UI",
+                9,
+                "bold"
+            )
+        )
+
+        # Заголовки координат.
+        for x in range(
+            GRID_W
+        ):
+            px = (
+                ox
+                + x * cell_size
+                + cell_size / 2
+            )
+
+            canvas.create_text(
+                px,
+                oy - 10,
+                text=f"{x + 1:02d}",
+                fill="#627985",
+                font=(
+                    "Consolas",
+                    7,
+                    "bold"
+                )
+            )
+
+        for y in range(
+            GRID_H
+        ):
+            py = (
+                oy
+                + y * cell_size
+                + cell_size / 2
+            )
+
+            canvas.create_text(
+                ox - 13,
+                py,
+                text=f"{y + 1:02d}",
+                fill="#627985",
+                font=(
+                    "Consolas",
+                    7,
+                    "bold"
+                )
+            )
+
+        # Карта клеток.
+        for y in range(
+            GRID_H
+        ):
+            for x in range(
+                GRID_W
+            ):
+                cell = self.sim.planet.cells[
+                    y
+                ][x]
+
+                x1 = (
+                    ox
+                    + x * cell_size
+                )
+
+                y1 = (
+                    oy
+                    + y * cell_size
+                )
+
+                x2 = (
+                    x1
+                    + cell_size
+                )
+
+                y2 = (
+                    y1
+                    + cell_size
+                )
+
+                outline = "#16242c"
+
+                if cell.biome == "АНОМАЛИЯ":
+                    outline = "#b174c7"
+
+                canvas.create_rectangle(
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    fill=BIOME_FILL[
+                        cell.biome
+                    ],
+                    outline=outline,
+                    width=1
+                )
+
+                if cell_size >= 30:
+                    canvas.create_text(
+                        x1 + 5,
+                        y1 + 5,
+                        anchor="nw",
+                        text=BIOME_SHORT[
+                            cell.biome
+                        ],
+                        fill="#dce7ed",
+                        font=(
+                            "Consolas",
+                            8,
+                            "bold"
+                        )
+                    )
+
+                # Полосы состояния клетки.
+                bar = max(
+                    2,
+                    int(
+                        cell_size
+                        * 0.07
+                    )
+                )
+
+                inner_w = max(
+                    4,
+                    cell_size - 8
+                )
+
+                # Ресурсы — снизу.
+                canvas.create_rectangle(
+                    x1 + 4,
+                    y2 - bar - 3,
+                    x1 + 4
+                    + inner_w
+                    * cell.resources,
+                    y2 - 3,
+                    fill="#9fd48f",
+                    outline=""
+                )
+
+                # Вода — сверху.
+                canvas.create_rectangle(
+                    x1 + 4,
+                    y1 + bar + 3,
+                    x1 + 4
+                    + inner_w
+                    * cell.water,
+                    y1 + 2 * bar + 3,
+                    fill="#8dc8e8",
+                    outline=""
+                )
+
+                # Радиация — справа.
+                rad_h = (
+                    cell_size - 10
+                ) * clamp(
+                    cell.radiation
+                )
+
+                canvas.create_rectangle(
+                    x2 - 5,
+                    y2 - 5 - rad_h,
+                    x2 - 2,
+                    y2 - 5,
+                    fill="#d989b8",
+                    outline=""
+                )
+
+        # Сущности.
+        for organism in self.sim.population:
+            if not organism.alive:
+                continue
+
+            px = (
+                ox
+                + organism.x
+                * cell_size
+                + cell_size / 2
+            )
+
+            py = (
+                oy
+                + organism.y
+                * cell_size
+                + cell_size / 2
+            )
+
+            radius = max(
+                4,
+                cell_size * 0.16
+            )
+
+            fill = ACTION_FILL.get(
+                organism.last_action,
+                "#e1f0f6"
+            )
+
+            if (
+                organism.id
+                == self.sim.selected_id
+            ):
+                canvas.create_oval(
+                    px - radius - 6,
+                    py - radius - 6,
+                    px + radius + 6,
+                    py + radius + 6,
+                    outline="#ffffff",
+                    width=2
+                )
+
+            canvas.create_oval(
+                px - radius,
+                py - radius,
+                px + radius,
+                py + radius,
+                fill=fill,
+                outline="#091017",
+                width=1
+            )
+
+        # При высокой загрузке клетки
+        # показываем число сущностей.
+        per_cell = Counter(
+            (
+                o.x,
+                o.y
+            )
+            for o in self.sim.population
+            if o.alive
+        )
+
+        for (
+            gx,
+            gy
+        ), count in per_cell.items():
+
+            if count > 1:
+                x1 = (
+                    ox
+                    + gx
+                    * cell_size
+                )
+
+                y1 = (
+                    oy
+                    + gy
+                    * cell_size
+                )
+
+                canvas.create_oval(
+                    x1 + cell_size - 17,
+                    y1 + 4,
+                    x1 + cell_size - 4,
+                    y1 + 17,
+                    fill="#0a1116",
+                    outline="#a9bcc6"
+                )
+
+                canvas.create_text(
+                    x1
+                    + cell_size
+                    - 10.5,
+                    y1 + 10.5,
+                    text=str(count),
+                    fill="#f0f7fb",
+                    font=(
+                        "Consolas",
+                        7,
+                        "bold"
+                    )
+                )
+
+        canvas.create_rectangle(
+            ox,
+            oy,
+            ox + GRID_W * cell_size,
+            oy + GRID_H * cell_size,
+            outline="#334955",
+            width=1
+        )
+
+        self._map_leave()
+
+    def _draw_chart(self):
+        canvas = self.chart_canvas
+
+        canvas.delete(
+            "all"
+        )
+
+        w = max(
+            50,
+            canvas.winfo_width()
+        )
+
+        h = max(
+            50,
+            canvas.winfo_height()
+        )
+
+        data = self.sim.history[
+            -160:
+        ]
+
+        if len(data) < 2:
+            canvas.create_text(
+                w / 2,
+                h / 2,
+                text=(
+                    "График появится "
+                    "после запуска симуляции"
+                ),
+                fill="#6f8794",
+                font=(
+                    "Segoe UI",
+                    10
+                )
+            )
+
+            return
+
+        left = 42
+        right = 12
+        top = 18
+        bottom = 24
+
+        pw = (
+            w
+            - left
+            - right
+        )
+
+        ph = (
+            h
+            - top
+            - bottom
+        )
+
+        canvas.create_rectangle(
+            left,
+            top,
+            left + pw,
+            top + ph,
+            outline="#1a2832"
+        )
+
+        for i in range(
+            1,
+            4
+        ):
+            y = (
+                top
+                + ph * i / 4
+            )
+
+            canvas.create_line(
+                left,
+                y,
+                left + pw,
+                y,
+                fill="#121e26"
+            )
+
+        max_pop = max(
+            1,
+            max(
+                max(
+                    d[
+                        "population"
+                    ]
+                    for d in data
+                ),
+                max(
+                    d[
+                        "capacity"
+                    ]
+                    for d in data
+                )
+            )
+        )
+
+        max_gen = max(
+            1,
+            max(
+                d[
+                    "generation"
+                ]
+                for d in data
+            )
+        )
+
+        pop_points = []
+        cap_points = []
+        gen_points = []
+
+        for i, row in enumerate(
+            data
+        ):
+            x = (
+                left
+                + pw
+                * i
+                / (
+                    len(data)
+                    - 1
+                )
+            )
+
+            py = (
+                top
+                + ph
+                - (
+                    row[
+                        "population"
+                    ]
+                    / max_pop
+                )
+                * ph
+            )
+
+            cy = (
+                top
+                + ph
+                - (
+                    row[
+                        "capacity"
+                    ]
+                    / max_pop
+                )
+                * ph
+            )
+
+            gy = (
+                top
+                + ph
+                - (
+                    row[
+                        "generation"
+                    ]
+                    / max_gen
+                )
+                * ph
+            )
+
+            pop_points.extend(
+                [
+                    x,
+                    py
+                ]
+            )
+
+            cap_points.extend(
+                [
+                    x,
+                    cy
+                ]
+            )
+
+            gen_points.extend(
+                [
+                    x,
+                    gy
+                ]
+            )
+
+        if len(
+            pop_points
+        ) >= 4:
+            canvas.create_line(
+                *pop_points,
+                fill="#79c6df",
+                width=2
+            )
+
+            canvas.create_line(
+                *cap_points,
+                fill="#6f8794",
+                width=1,
+                dash=(
+                    5,
+                    3
+                )
+            )
+
+            canvas.create_line(
+                *gen_points,
+                fill="#c892e8",
+                width=2
+            )
+
+        canvas.create_text(
+            left,
+            7,
+            anchor="w",
+            text="ПОПУЛЯЦИЯ",
+            fill="#79c6df",
+            font=(
+                "Consolas",
+                8,
+                "bold"
+            )
+        )
+
+        canvas.create_text(
+            left + 88,
+            7,
+            anchor="w",
+            text="ЁМКОСТЬ",
+            fill="#6f8794",
+            font=(
+                "Consolas",
+                8,
+                "bold"
+            )
+        )
+
+        canvas.create_text(
+            left + 165,
+            7,
+            anchor="w",
+            text="ПОКОЛЕНИЯ",
+            fill="#c892e8",
+            font=(
+                "Consolas",
+                8,
+                "bold"
+            )
+        )
+
+        canvas.create_text(
+            left,
+            h - 7,
+            anchor="w",
+            text=(
+                f"тик {data[0]['tick']}"
+            ),
+            fill="#5f7481",
+            font=(
+                "Consolas",
+                7
+            )
+        )
+
+        canvas.create_text(
+            left + pw,
+            h - 7,
+            anchor="e",
+            text=(
+                f"тик {data[-1]['tick']}"
+            ),
+            fill="#5f7481",
+            font=(
+                "Consolas",
+                7
+            )
+        )
+
+    def _render(self):
+        self._draw_world()
+        self._draw_chart()
+        self._render_quick_state()
+        self._render_organism()
+        self._render_decision()
+        self._render_metrics()
+        self._render_log()
+
+    def _render_quick_state(self):
+        p = self.sim.planet
+
+        alive = sum(
+            o.alive
+            for o in self.sim.population
+        )
+
+        self.quick_text.delete(
+            "1.0",
+            "end"
+        )
+
+        self.quick_text.insert(
+            "end",
+            f"Температура:       "
+            f"{percent(p.temperature):3d}%\n"
+            f"Вода:              "
+            f"{percent(p.water):3d}%\n"
+            f"Ресурсы:           "
+            f"{percent(p.resources):3d}%\n"
+            f"Радиация:          "
+            f"{percent(p.radiation):3d}%\n"
+            f"Стабильность:      "
+            f"{percent(p.stability):3d}%\n"
+            f"Солнечная активн.: "
+            f"{percent(p.solar_activity):3d}%\n"
+            f"Популяция:         "
+            f"{alive:3d}\n"
+            f"Рождение / смерть: "
+            f"{self.sim.births:3d} / "
+            f"{self.sim.deaths:3d}\n"
+            f"Экологическая ёмкость: "
+            f"{self.sim.carrying_capacity():3d}\n"
+            f"Статус среды:      "
+            f"{self._environment_status():s}\n"
+        )
+
+    def _environment_status(self):
+        p = self.sim.planet
+
+        capacity = (
+            self.sim.carrying_capacity()
+        )
+
+        pop = sum(
+            o.alive
+            for o in self.sim.population
+        )
+
+        ratio = (
+            pop
+            / max(
+                1,
+                capacity
+            )
+        )
+
+        if (
+            p.radiation > 0.78
+            or p.water < 0.15
+            or p.resources < 0.15
+        ):
+            return "КРИТИЧЕСКАЯ"
+
+        if ratio > 0.95:
+            return "ПЕРЕГРУЖЕНА"
+
+        if (
+            p.radiation > 0.58
+            or p.water < 0.30
+            or p.resources < 0.30
+        ):
+            return "НАПРЯЖЁННАЯ"
+
+        if (
+            p.stability > 0.68
+            and p.water > 0.50
+            and p.resources > 0.50
+            and p.radiation < 0.35
+        ):
+            return "БЛАГОПРИЯТНАЯ"
+
+        return "СТАБИЛЬНАЯ"
+
+    def _render_organism(self):
+        self.org_text.delete(
+            "1.0",
+            "end"
+        )
+
+        organism = (
+            self.sim.get_selected()
+        )
+
+        if not organism:
+            self.org_text.insert(
+                "end",
+                "Нет выбранной живой сущности.\n\n"
+                "Нажми на точку ● на карте."
+            )
+
+            return
+
+        cell = (
+            self.sim.planet.get_cell(
+                organism.x,
+                organism.y
+            )
+        )
+
+        self.org_text.insert(
+            "end",
+            f"СУЩНОСТЬ #{organism.id}\n\n"
+            f"Родитель:          "
+            f"#{organism.parent_id or '-'}\n"
+            f"Поколение:         "
+            f"{organism.generation}\n"
+            f"Возраст:           "
+            f"{organism.age}\n"
+            f"Положение:         "
+            f"({organism.x}, "
+            f"{organism.y})\n"
+            f"Среда:             "
+            f"{BIOME_RU[cell.biome]}\n\n"
+            f"Энергия:           "
+            f"{percent(organism.energy)}%\n"
+            f"Гидратация:        "
+            f"{percent(organism.hydration)}%\n"
+            f"Здоровье:          "
+            f"{percent(organism.health)}%\n"
+            f"Память:            "
+            f"{percent(organism.memory)}%\n"
+            f"Последнее действие: "
+            f"{organism.last_action}\n"
+            f"Потомков:          "
+            f"{organism.children}\n\n"
+            "ГЕНОМ\n"
+        )
+
+        for key, value in (
+            organism.genome.values.items()
+        ):
+            label = Genome.LABELS[
+                key
+            ]
+
+            self.org_text.insert(
+                "end",
+                f"{label:20} "
+                f"{value:.3f}\n"
+            )
+
+    def _render_decision(self):
+        self.decision_text.delete(
+            "1.0",
+            "end"
+        )
+
+        organism = (
+            self.sim.get_selected()
+        )
+
+        if (
+            not organism
+            or not organism.last_decision
+        ):
+            self.decision_text.insert(
+                "end",
+                "Решение ещё не рассчитано.\n"
+                "Запусти симуляцию или сделай "
+                "один шаг."
+            )
+
+            return
+
+        decision = (
+            organism.last_decision
+        )
+
+        self.decision_text.insert(
+            "end",
+            f"ВЫБРАНО:\n"
+            f"{decision.action}\n\n"
+            "Оценка всех альтернатив:\n\n"
+        )
+
+        ordered = sorted(
+            decision.scores.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+
+        for action, score in ordered:
+            marker = (
+                "  ← выбор"
+                if action == decision.action
+                else ""
+            )
+
+            self.decision_text.insert(
+                "end",
+                f"{score:6.3f}  "
+                f"{action}{marker}\n"
+            )
+
+        self.decision_text.insert(
+            "end",
+            "\nЧто влияет на выбор:\n"
+            f"• память: "
+            f"{organism.memory:.3f}\n"
+            f"• вес памяти: "
+            f"{organism.genome.values['memory_weight']:.3f}\n"
+            f"• терпимость к риску: "
+            f"{organism.genome.values['risk_tolerance']:.3f}\n"
+            f"• последнее вознаграждение: "
+            f"{organism.last_reward:+.3f}\n"
+        )
+
+    def _render_metrics(self):
+        self.analytics_text.delete(
+            "1.0",
+            "end"
+        )
+
+        last = (
+            self.sim.history[-1]
+            if self.sim.history
+            else None
+        )
+
+        if not last:
+            self.analytics_text.insert(
+                "end",
+                "Метрики появятся после "
+                "запуска симуляции."
+            )
+
+            return
+
+        self.analytics_text.insert(
+            "end",
+            "ОСНОВНЫЕ МЕТРИКИ\n\n"
+            f"Мощность:                 "
+            f"{last['power']:.3f}\n"
+            f"Эффективность:            "
+            f"{last['efficiency']:.3f}\n"
+            f"Энтропия поведения:       "
+            f"{last['entropy']:.3f}\n"
+            f"Задержка решения:         "
+            f"{last['latency']:.3f}\n"
+            f"Разнообразие поведения:   "
+            f"{last['diversity']:.3f}\n\n"
+            "ЭВОЛЮЦИЯ\n\n"
+            f"Поколение:                 "
+            f"{self.sim.max_generation}\n"
+            f"Рождений:                  "
+            f"{self.sim.births}\n"
+            f"Смертей:                   "
+            f"{self.sim.deaths}\n"
+            f"Живых сейчас:              "
+            f"{last['population']}\n\n"
+            "Среда\n\n"
+            f"Температура:               "
+            f"{last['temperature']:.3f}\n"
+            f"Вода:                      "
+            f"{last['water']:.3f}\n"
+            f"Ресурсы:                   "
+            f"{last['resources']:.3f}\n"
+            f"Радиация:                  "
+            f"{last['radiation']:.3f}\n"
+        )
+
+    def _render_log(self):
+        self.log_text.delete(
+            "1.0",
+            "end"
+        )
+
+        self.log_text.insert(
+            "end",
+            "Последние события:\n\n"
+        )
+
+        for line in (
+            self.sim.journal[-60:]
+        ):
+            self.log_text.insert(
+                "end",
+                line + "\n"
+            )
+
+        self.log_text.see(
+            "end"
+        )
+
+    def _loop(self):
+        if self.running:
+            self.speed = max(
+                1,
+                int(
+                    self.vars[
+                        "speed"
+                    ].get()
+                )
+            )
+
+            for _ in range(
+                self.speed
+            ):
+                self.sim.step()
+
+                if not any(
+                    o.alive
+                    for o in self.sim.population
+                ):
+                    self.running = False
+
+                    self.status_label.config(
+                        text="ВЫМИРАНИЕ",
+                        fg="#ff7f7f"
+                    )
+
+                    break
+
+            self._render()
+
+        else:
+            # Обновляем значения интерфейса
+            # даже когда симуляция на паузе.
+            self._render()
+
+        self.after(
+            TICK_MS,
+            self._loop
+        )
+
+
+if __name__ == "__main__":
+    app = AstraApp()
+    app.mainloop()
