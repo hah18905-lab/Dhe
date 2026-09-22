@@ -1,0 +1,1327 @@
+#include "raylib.h"
+#include "raymath.h"
+#include <cmath>
+
+static float ClampFloat(float value, float minValue, float maxValue)
+{
+    if (value < minValue) return minValue;
+    if (value > maxValue) return maxValue;
+    return value;
+}
+
+static Color LerpColor(Color a, Color b, float amount)
+{
+    amount = ClampFloat(amount, 0.0f, 1.0f);
+
+    Color result{};
+    result.r = (unsigned char)ClampFloat((float)a.r + ((float)b.r - (float)a.r) * amount, 0.0f, 255.0f);
+    result.g = (unsigned char)ClampFloat((float)a.g + ((float)b.g - (float)a.g) * amount, 0.0f, 255.0f);
+    result.b = (unsigned char)ClampFloat((float)a.b + ((float)b.b - (float)a.b) * amount, 0.0f, 255.0f);
+    result.a = 255;
+    return result;
+}
+
+struct Note
+{
+    Vector3 position;
+    const char* title;
+    const char* text;
+    bool found;
+};
+
+struct CollisionBox
+{
+    Vector3 position;
+    Vector3 size;
+};
+
+static bool CheckPlayerCollision(Vector3 playerPosition, float playerRadius, const CollisionBox& box)
+{
+    float minX = box.position.x - box.size.x / 2.0f;
+    float maxX = box.position.x + box.size.x / 2.0f;
+    float minZ = box.position.z - box.size.z / 2.0f;
+    float maxZ = box.position.z + box.size.z / 2.0f;
+
+    float closestX = ClampFloat(playerPosition.x, minX, maxX);
+    float closestZ = ClampFloat(playerPosition.z, minZ, maxZ);
+
+    float dx = playerPosition.x - closestX;
+    float dz = playerPosition.z - closestZ;
+
+    return (dx * dx + dz * dz) < (playerRadius * playerRadius);
+}
+
+static bool IsNearAndLookingAt(Camera3D camera, Vector3 objectPosition, float distanceLimit, float dotLimit)
+{
+    Vector3 toObject = Vector3Subtract(objectPosition, camera.position);
+    float distance = Vector3Length(toObject);
+
+    if (distance > distanceLimit || distance < 0.001f)
+        return false;
+
+    toObject = Vector3Normalize(toObject);
+
+    Vector3 direction = Vector3Subtract(camera.target, camera.position);
+
+    if (Vector3Length(direction) < 0.001f)
+        return false;
+
+    direction = Vector3Normalize(direction);
+
+    return Vector3DotProduct(direction, toObject) > dotLimit;
+}
+
+
+
+static bool CheckMainBuildingCollision(
+    Vector3 playerPosition,
+    float playerRadius,
+    bool doorOpen)
+{
+    const float buildingX = 0.0f;
+    const float buildingZ = 18.0f;
+    const float buildingWidth = 14.0f;
+    const float buildingDepth = 10.0f;
+    const float wallThickness = 0.45f;
+    const float buildingHeight = 4.0f;
+    const float doorWidth = 2.4f;
+
+    const float halfWidth = buildingWidth / 2.0f;
+    const float halfDepth = buildingDepth / 2.0f;
+    const float frontZ = buildingZ - halfDepth + wallThickness / 2.0f;
+    const float backZ = buildingZ + halfDepth - wallThickness / 2.0f;
+    const float leftX = buildingX - halfWidth + wallThickness / 2.0f;
+    const float rightX = buildingX + halfWidth - wallThickness / 2.0f;
+
+    const float frontSegmentWidth = (buildingWidth - doorWidth) / 2.0f;
+    const float frontLeftX =
+        buildingX - doorWidth / 2.0f - frontSegmentWidth / 2.0f;
+    const float frontRightX =
+        buildingX + doorWidth / 2.0f + frontSegmentWidth / 2.0f;
+
+    CollisionBox walls[] =
+    {
+        { { frontLeftX, buildingHeight / 2.0f, frontZ },
+          { frontSegmentWidth, buildingHeight, wallThickness } },
+
+        { { frontRightX, buildingHeight / 2.0f, frontZ },
+          { frontSegmentWidth, buildingHeight, wallThickness } },
+
+        { { buildingX, buildingHeight / 2.0f, backZ },
+          { buildingWidth, buildingHeight, wallThickness } },
+
+        { { leftX, buildingHeight / 2.0f, buildingZ },
+          { wallThickness, buildingHeight, buildingDepth } },
+
+        { { rightX, buildingHeight / 2.0f, buildingZ },
+          { wallThickness, buildingHeight, buildingDepth } }
+    };
+
+    const int wallCount = (int)(sizeof(walls) / sizeof(walls[0]));
+
+    for (int i = 0; i < wallCount; i++)
+    {
+        if (CheckPlayerCollision(playerPosition, playerRadius, walls[i]))
+            return true;
+    }
+
+    if (!doorOpen)
+    {
+        CollisionBox doorCollision =
+        {
+            { buildingX, 1.3f, frontZ },
+            { doorWidth, 2.6f, wallThickness }
+        };
+
+        if (CheckPlayerCollision(playerPosition, playerRadius, doorCollision))
+            return true;
+    }
+
+    return false;
+}
+
+static bool IsInsideMainBuilding(Vector3 playerPosition)
+{
+    const float minX = -6.35f;
+    const float maxX =  6.35f;
+    const float minZ =  13.45f;
+    const float maxZ =  22.55f;
+
+    return playerPosition.x > minX &&
+           playerPosition.x < maxX &&
+           playerPosition.z > minZ &&
+           playerPosition.z < maxZ;
+}
+
+
+enum class TimePeriod
+{
+    NIGHT,
+    DAWN,
+    DAY,
+    EVENING
+};
+
+static TimePeriod GetTimePeriod(float gameMinutes)
+{
+    if (gameMinutes >= 5.0f * 60.0f && gameMinutes < 7.0f * 60.0f)
+        return TimePeriod::DAWN;
+
+    if (gameMinutes >= 7.0f * 60.0f && gameMinutes < 18.0f * 60.0f)
+        return TimePeriod::DAY;
+
+    if (gameMinutes >= 18.0f * 60.0f && gameMinutes < 20.0f * 60.0f)
+        return TimePeriod::EVENING;
+
+    return TimePeriod::NIGHT;
+}
+
+static const char* GetTimePeriodText(TimePeriod period)
+{
+    switch (period)
+    {
+        case TimePeriod::DAWN: return "DAWN";
+        case TimePeriod::DAY: return "DAYLIGHT";
+        case TimePeriod::EVENING: return "EVENING";
+        default: return "NIGHT";
+    }
+}
+
+static Color GetSkyColor(float gameMinutes)
+{
+    const Color nightColor = { 5, 8, 18, 255 };
+    const Color dawnColor = { 85, 95, 115, 255 };
+    const Color dayColor = { 110, 160, 190, 255 };
+    const Color eveningColor = { 70, 55, 80, 255 };
+
+    // 00:00 - 05:00 -> night
+    if (gameMinutes < 5.0f * 60.0f)
+        return nightColor;
+
+    // 05:00 - 07:00 -> sunrise
+    if (gameMinutes < 7.0f * 60.0f)
+        return LerpColor(nightColor, dayColor,
+            (gameMinutes - 5.0f * 60.0f) / (2.0f * 60.0f));
+
+    // 07:00 - 18:00 -> day
+    if (gameMinutes < 18.0f * 60.0f)
+        return dayColor;
+
+    // 18:00 - 20:00 -> sunset
+    if (gameMinutes < 20.0f * 60.0f)
+        return LerpColor(dayColor, eveningColor,
+            (gameMinutes - 18.0f * 60.0f) / (2.0f * 60.0f));
+
+    // 20:00 - 24:00 -> night
+    return nightColor;
+}
+
+static float GetNightDarkness(float gameMinutes)
+{
+    // 0.0 = no extra darkness, 1.0 = maximum overlay.
+    // This is only an atmospheric screen overlay; it does not change movement or physics.
+
+    if (gameMinutes < 5.0f * 60.0f)
+        return 0.72f;
+
+    if (gameMinutes < 7.0f * 60.0f)
+    {
+        float t = (gameMinutes - 5.0f * 60.0f) / (2.0f * 60.0f);
+        return 0.72f * (1.0f - t);
+    }
+
+    if (gameMinutes < 18.0f * 60.0f)
+        return 0.0f;
+
+    if (gameMinutes < 20.0f * 60.0f)
+    {
+        float t = (gameMinutes - 18.0f * 60.0f) / (2.0f * 60.0f);
+        return 0.48f * t;
+    }
+
+    return 0.72f;
+}
+
+static bool UpdateGameClock(
+    int& currentDay,
+    float& gameMinutes,
+    int totalDays,
+    float deltaTime,
+    float gameMinutesPerSecond)
+{
+    gameMinutes += gameMinutesPerSecond * deltaTime;
+
+    bool dayChanged = false;
+
+    while (gameMinutes >= 24.0f * 60.0f)
+    {
+        gameMinutes -= 24.0f * 60.0f;
+        currentDay++;
+        dayChanged = true;
+
+        if (currentDay > totalDays)
+        {
+            currentDay = totalDays;
+            gameMinutes = 23.0f * 60.0f + 59.0f;
+            return dayChanged;
+        }
+    }
+
+    return dayChanged;
+}
+
+
+enum class Day1StoryStage
+{
+    ARRIVAL,
+    INVESTIGATION,
+    FIRST_STRANGE_SIGN,
+    EVENING,
+    BUILDING_INVESTIGATION,
+    COLLEAGUES_GONE,
+    FIRST_NIGHT,
+    COMPLETE
+};
+
+static void SetStoryMessage(
+    Day1StoryStage& stage,
+    Day1StoryStage newStage,
+    const char*& title,
+    const char*& message,
+    const char*& objective,
+    float& timer,
+    const char* newTitle,
+    const char* newMessage,
+    const char* newObjective)
+{
+    stage = newStage;
+    title = newTitle;
+    message = newMessage;
+    objective = newObjective;
+    timer = 6.0f;
+}
+
+int main()
+{
+    const int SCREEN_WIDTH = 1280;
+    const int SCREEN_HEIGHT = 720;
+
+    InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, "До рассвета - 1.4");
+    SetTargetFPS(60);
+    DisableCursor();
+
+    Camera3D camera = { 0 };
+    camera.position = { 0.0f, 2.0f, 0.0f };
+    camera.target = { 0.0f, 2.0f, 1.0f };
+    camera.up = { 0.0f, 1.0f, 0.0f };
+    camera.fovy = 75.0f;
+    camera.projection = CAMERA_PERSPECTIVE;
+
+    float jumpOffset = 0.0f;
+    float verticalVelocity = 0.0f;
+    const float JUMP_FORCE = 7.0f;
+    const float GRAVITY = 18.0f;
+    bool isGrounded = true;
+
+    const float PLAYER_RADIUS = 0.45f;
+    const float MAP_HALF_SIZE = 250.0f;
+
+    // ===== NEW 7-DAY CLOCK =====
+    const int TOTAL_DAYS = 7;
+    int currentDay = 1;
+
+    // Game starts at 17:00 on Day 1.
+    float gameMinutes = 17.0f * 60.0f;
+
+    // 1 real second = 1 in-game minute.
+    // Slower pacing for longer exploration and story events.
+    const float GAME_MINUTES_PER_SECOND = 1.0f;
+
+    bool gameFinished = false;
+    float dayBannerTimer = 0.0f;
+
+    // ===== DAY 1 STORY + INTERACTION =====
+    Day1StoryStage day1StoryStage = Day1StoryStage::ARRIVAL;
+
+    const char* storyTitle = "DAY 1 - ARRIVAL";
+    const char* storyMessage =
+        "Seven police officers arrived at the abandoned summer camp.";
+    const char* storyObjective =
+        "Explore the camp and inspect the buildings.";
+
+    float storyMessageTimer = 7.0f;
+
+    bool buildingInspectionStarted = false;
+    float buildingInspectionEndMinutes = 23.0f * 60.0f;
+
+    bool colleaguesGone = false;
+
+    bool mainBuildingNearby = false;
+
+    bool mainDoorOpen = false;
+    bool lookingAtMainDoor = false;
+    bool playerInsideMainBuilding = false;
+    bool wasInsideMainBuilding = false;
+
+    const Vector3 MAIN_DOOR_INTERACTION_POS = { 0.0f, 1.3f, 12.75f };
+
+    bool flashlight = false;
+
+    Vector3 itemPosition = { 4.0f, 0.5f, 8.0f };
+    bool itemCollected = false;
+    bool lookingAtItem = false;
+    const float interactionDistance = 3.0f;
+
+    bool showPickupMessage = false;
+    float pickupMessageTimer = 0.0f;
+
+    const float MAP_SIZE = 500.0f;
+
+    Model ground = LoadModelFromMesh(GenMeshPlane(MAP_SIZE, MAP_SIZE, 1, 1));
+    Model treeTrunk = LoadModelFromMesh(GenMeshCylinder(0.35f, 4.0f, 8));
+    Model treeLeaves = LoadModelFromMesh(GenMeshCone(2.5f, 5.0f, 8));
+    // Main building is now a larger interactive shell with a real doorway.
+    const float MAIN_BUILDING_WIDTH = 14.0f;
+    const float MAIN_BUILDING_DEPTH = 10.0f;
+    const float MAIN_BUILDING_HEIGHT = 4.0f;
+    const float MAIN_DOOR_WIDTH = 2.4f;
+    const float MAIN_WALL_THICKNESS = 0.45f;
+    const float MAIN_BUILDING_Z = 18.0f;
+    Model tentBody = LoadModelFromMesh(GenMeshCube(3.0f, 1.5f, 4.0f));
+    Model crateModel = LoadModelFromMesh(GenMeshCube(1.2f, 1.2f, 1.2f));
+    Model logModel = LoadModelFromMesh(GenMeshCylinder(0.25f, 3.0f, 8));
+
+    CollisionBox collisions[] =
+    {
+        { { -8.0f, 0.75f, 4.0f }, { 3.0f, 1.5f, 4.0f } },
+        { { 8.0f, 0.75f, 4.0f }, { 3.0f, 1.5f, 4.0f } },
+        { { -4.0f, 0.6f, 7.0f }, { 1.2f, 1.2f, 1.2f } },
+        { { -2.5f, 0.6f, 7.0f }, { 1.2f, 1.2f, 1.2f } },
+        { { 4.0f, 0.6f, 7.0f }, { 1.2f, 1.2f, 1.2f } },
+        { { -35.0f, 2.5f, 35.0f }, { 16.0f, 5.0f, 12.0f } },
+        { { 35.0f, 2.5f, 35.0f }, { 18.0f, 5.0f, 12.0f } },
+        { { -35.0f, 2.5f, -30.0f }, { 12.0f, 5.0f, 10.0f } },
+        { { 40.0f, 2.5f, -35.0f }, { 12.0f, 5.0f, 10.0f } },
+        { { 100.0f, 2.5f, 70.0f }, { 16.0f, 5.0f, 14.0f } },
+        { { -100.0f, 2.5f, 80.0f }, { 18.0f, 5.0f, 12.0f } }
+    };
+
+    const int collisionCount = (int)(sizeof(collisions) / sizeof(collisions[0]));
+
+    const int NOTE_COUNT = 3;
+
+    Note notes[NOTE_COUNT] =
+    {
+        {
+            { -8.0f, 1.2f, 4.0f },
+            "ЗАПИСКА №1",
+            "7 августа 2016 года.\n"
+            "Сегодня ночью я снова слышал\n"
+            "тяжелое дыхание в углу комнаты.\n"
+            "Я притворился спящим.\n\n"
+            "Через минуту дыхание исчезло.\n"
+            "Из соседней комнаты раздался крик.\n"
+            "Утром мальчика уже не нашли.",
+            false
+        },
+        {
+            { 4.0f, 1.0f, 7.0f },
+            "ЗАПИСКА №2",
+            "Вожатые говорят, что ночью\n"
+            "нельзя отвечать, если кто-то\n"
+            "зовет тебя из леса.\n\n"
+            "Я сначала смеялся над этим.\n"
+            "Теперь я больше не смеюсь.",
+            false
+        },
+        {
+            { 0.0f, 2.0f, 15.0f },
+            "ЗАПИСКА №3",
+            "Если ночью услышишь шаги\n"
+            "за дверью — не открывай.\n\n"
+            "Даже если голос за дверью\n"
+            "будет голосом человека,\n"
+            "которого ты хорошо знаешь.",
+            false
+        }
+    };
+
+    int openedNote = -1;
+    bool noteOpen = false;
+    bool journalOpen = false;
+
+    while (!WindowShouldClose())
+    {
+        float deltaTime = GetFrameTime();
+
+        camera.position.y -= jumpOffset;
+        camera.target.y -= jumpOffset;
+        UpdateCamera(&camera, CAMERA_FIRST_PERSON);
+
+        if (jumpOffset <= 0.0f)
+        {
+            jumpOffset = 0.0f;
+            verticalVelocity = 0.0f;
+            isGrounded = true;
+        }
+
+        if (IsKeyPressed(KEY_SPACE) && isGrounded && !noteOpen && !journalOpen)
+        {
+            verticalVelocity = JUMP_FORCE;
+            isGrounded = false;
+        }
+
+        if (!isGrounded)
+        {
+            verticalVelocity -= GRAVITY * deltaTime;
+            jumpOffset += verticalVelocity * deltaTime;
+
+            if (jumpOffset <= 0.0f)
+            {
+                jumpOffset = 0.0f;
+                verticalVelocity = 0.0f;
+                isGrounded = true;
+            }
+        }
+
+        camera.position.y += jumpOffset;
+        camera.target.y += jumpOffset;
+
+        Vector3 oldPosition = camera.position;
+
+        Vector3 testPosition = camera.position;
+        bool blockedX = false;
+
+        for (int i = 0; i < collisionCount; i++)
+        {
+            if (CheckPlayerCollision(testPosition, PLAYER_RADIUS, collisions[i]) ||
+                CheckMainBuildingCollision(testPosition, PLAYER_RADIUS, mainDoorOpen))
+            {
+                blockedX = true;
+                break;
+            }
+        }
+
+        if (blockedX)
+            camera.position.x = oldPosition.x;
+
+        testPosition = camera.position;
+        bool blockedZ = false;
+
+        for (int i = 0; i < collisionCount; i++)
+        {
+            if (CheckPlayerCollision(testPosition, PLAYER_RADIUS, collisions[i]) ||
+                CheckMainBuildingCollision(testPosition, PLAYER_RADIUS, mainDoorOpen))
+            {
+                blockedZ = true;
+                break;
+            }
+        }
+
+        if (blockedZ)
+            camera.position.z = oldPosition.z;
+
+        camera.position.x = ClampFloat(camera.position.x, -MAP_HALF_SIZE + 2.0f, MAP_HALF_SIZE - 2.0f);
+        camera.position.z = ClampFloat(camera.position.z, -MAP_HALF_SIZE + 2.0f, MAP_HALF_SIZE - 2.0f);
+
+        wasInsideMainBuilding = playerInsideMainBuilding;
+        playerInsideMainBuilding = IsInsideMainBuilding(camera.position);
+
+        // Time stops while a note or the journal is open.
+        if (!gameFinished && !noteOpen && !journalOpen)
+        {
+            bool dayChanged = UpdateGameClock(
+                currentDay,
+                gameMinutes,
+                TOTAL_DAYS,
+                deltaTime,
+                GAME_MINUTES_PER_SECOND
+            );
+
+            if (dayChanged)
+            {
+                dayBannerTimer = 3.0f;
+
+                if (currentDay == TOTAL_DAYS && gameMinutes >= 23.0f * 60.0f)
+                    gameFinished = true;
+            }
+        }
+
+        if (dayBannerTimer > 0.0f)
+        {
+            dayBannerTimer -= deltaTime;
+            if (dayBannerTimer < 0.0f)
+                dayBannerTimer = 0.0f;
+        }
+
+        // ===== DAY 1 STORY EVENTS =====
+        if (currentDay == 1 && !gameFinished && !noteOpen && !journalOpen)
+        {
+            // Arrival is shown immediately. After ten in-game minutes,
+            // the player gets the first free-investigation objective.
+            if (day1StoryStage == Day1StoryStage::ARRIVAL &&
+                gameMinutes >= 17.0f * 60.0f + 10.0f)
+            {
+                SetStoryMessage(
+                    day1StoryStage,
+                    Day1StoryStage::INVESTIGATION,
+                    storyTitle,
+                    storyMessage,
+                    storyObjective,
+                    storyMessageTimer,
+                    "DAY 1 - INVESTIGATION",
+                    "The camp is empty. No staff or children can be found.",
+                    "Search the camp and inspect the buildings."
+                );
+            }
+
+            // First strange sign.
+            if (day1StoryStage == Day1StoryStage::INVESTIGATION &&
+                gameMinutes >= 20.0f * 60.0f)
+            {
+                SetStoryMessage(
+                    day1StoryStage,
+                    Day1StoryStage::FIRST_STRANGE_SIGN,
+                    storyTitle,
+                    storyMessage,
+                    storyObjective,
+                    storyMessageTimer,
+                    "20:00 - SOMETHING IS WRONG",
+                    "The camp looks abandoned, but some objects seem to have been moved recently.",
+                    "Keep searching. Pay attention to anything unusual."
+                );
+            }
+
+            // Evening.
+            if (day1StoryStage == Day1StoryStage::FIRST_STRANGE_SIGN &&
+                gameMinutes >= 21.0f * 60.0f)
+            {
+                SetStoryMessage(
+                    day1StoryStage,
+                    Day1StoryStage::EVENING,
+                    storyTitle,
+                    storyMessage,
+                    storyObjective,
+                    storyMessageTimer,
+                    "21:00 - EVENING",
+                    "Darkness is approaching. The forest around the camp is getting quieter.",
+                    "Finish the inspection before midnight."
+                );
+            }
+
+            // Building objective at 22:30.
+            if (day1StoryStage == Day1StoryStage::EVENING &&
+                gameMinutes >= 22.0f * 60.0f + 30.0f)
+            {
+                SetStoryMessage(
+                    day1StoryStage,
+                    Day1StoryStage::BUILDING_INVESTIGATION,
+                    storyTitle,
+                    storyMessage,
+                    storyObjective,
+                    storyMessageTimer,
+                    "22:30 - MAIN BUILDING",
+                    "A final inspection of the main building should be completed before leaving.",
+                    "Go to the main building and investigate it."
+                );
+            }
+
+            // The main building is now a real interactive location.
+            // The 20-minute investigation starts only after the player
+            // actually enters the building.
+            mainBuildingNearby = false;
+
+            if (day1StoryStage == Day1StoryStage::BUILDING_INVESTIGATION)
+            {
+                Vector3 toDoor =
+                    Vector3Subtract(MAIN_DOOR_INTERACTION_POS, camera.position);
+
+                mainBuildingNearby = Vector3Length(toDoor) <= 5.0f;
+
+                if (playerInsideMainBuilding && !buildingInspectionStarted)
+                {
+                    buildingInspectionStarted = true;
+
+                    buildingInspectionEndMinutes = 23.0f * 60.0f;
+
+                    float minimumEnd = gameMinutes + 20.0f;
+                    if (minimumEnd > buildingInspectionEndMinutes)
+                        buildingInspectionEndMinutes = minimumEnd;
+
+                    SetStoryMessage(
+                        day1StoryStage,
+                        Day1StoryStage::BUILDING_INVESTIGATION,
+                        storyTitle,
+                        storyMessage,
+                        storyObjective,
+                        storyMessageTimer,
+                        "INSIDE THE BUILDING",
+                        "You begin a final inspection. The building is strangely quiet.",
+                        "Stay inside and investigate for a while."
+                    );
+                }
+
+                // Once 23:00 has arrived, the investigation can finish.
+                // The disappearance is triggered only when the player
+                // actually leaves the building.
+                if (buildingInspectionStarted &&
+                    playerInsideMainBuilding &&
+                    gameMinutes >= buildingInspectionEndMinutes)
+                {
+                    storyObjective = "Leave the building.";
+                }
+
+                if (buildingInspectionStarted &&
+                    wasInsideMainBuilding &&
+                    !playerInsideMainBuilding &&
+                    gameMinutes >= buildingInspectionEndMinutes)
+                {
+                    colleaguesGone = true;
+
+                    SetStoryMessage(
+                        day1StoryStage,
+                        Day1StoryStage::COLLEAGUES_GONE,
+                        storyTitle,
+                        storyMessage,
+                        storyObjective,
+                        storyMessageTimer,
+                        "23:00 - THEY ARE GONE",
+                        "You step outside. The other seven officers are gone. The vehicles are damaged and overturned.",
+                        "Search the camp. Find out what happened to your colleagues."
+                    );
+                }
+            }
+
+            // Prepare the first night.
+            if (day1StoryStage == Day1StoryStage::COLLEAGUES_GONE &&
+                gameMinutes >= 23.0f * 60.0f + 5.0f)
+            {
+                SetStoryMessage(
+                    day1StoryStage,
+                    Day1StoryStage::FIRST_NIGHT,
+                    storyTitle,
+                    storyMessage,
+                    storyObjective,
+                    storyMessageTimer,
+                    "23:05 - FIRST NIGHT",
+                    "There is no response on the radio. You are alone in the camp.",
+                    "Find a safe place and survive until morning."
+                );
+            }
+        }
+
+        // Day 1 ends naturally at midnight. Day 2 gets a clean starting objective.
+        if (currentDay >= 2 && day1StoryStage != Day1StoryStage::COMPLETE)
+        {
+            SetStoryMessage(
+                day1StoryStage,
+                Day1StoryStage::COMPLETE,
+                storyTitle,
+                storyMessage,
+                storyObjective,
+                storyMessageTimer,
+                "DAY 2 - THE MORNING AFTER",
+                "Morning comes, but your colleagues are still missing.",
+                "Start the investigation into the disappearances."
+            );
+        }
+
+        if (storyMessageTimer > 0.0f)
+        {
+            storyMessageTimer -= deltaTime;
+            if (storyMessageTimer < 0.0f)
+                storyMessageTimer = 0.0f;
+        }
+
+        if (noteOpen)
+        {
+            if (IsKeyPressed(KEY_E) || IsKeyPressed(KEY_ESCAPE))
+            {
+                noteOpen = false;
+                openedNote = -1;
+            }
+        }
+        else if (journalOpen)
+        {
+            if (IsKeyPressed(KEY_TAB) || IsKeyPressed(KEY_ESCAPE))
+                journalOpen = false;
+        }
+        else
+        {
+            if (IsKeyPressed(KEY_TAB))
+                journalOpen = true;
+
+            if (IsKeyPressed(KEY_F))
+                flashlight = !flashlight;
+
+            bool interactionUsed = false;
+
+            lookingAtMainDoor =
+                IsNearAndLookingAt(
+                    camera,
+                    MAIN_DOOR_INTERACTION_POS,
+                    3.2f,
+                    0.78f
+                );
+
+            if (lookingAtMainDoor && IsKeyPressed(KEY_E))
+            {
+                mainDoorOpen = !mainDoorOpen;
+                interactionUsed = true;
+            }
+
+            lookingAtItem = false;
+
+            if (!interactionUsed && !itemCollected)
+                lookingAtItem = IsNearAndLookingAt(camera, itemPosition, interactionDistance, 0.85f);
+
+            if (!interactionUsed && lookingAtItem && IsKeyPressed(KEY_E))
+            {
+                itemCollected = true;
+                showPickupMessage = true;
+                pickupMessageTimer = 3.0f;
+                interactionUsed = true;
+            }
+
+            for (int i = 0; i < NOTE_COUNT; i++)
+            {
+                if (notes[i].found)
+                    continue;
+
+                if (!interactionUsed &&
+                    IsNearAndLookingAt(camera, notes[i].position, 3.0f, 0.75f))
+                {
+                    if (IsKeyPressed(KEY_E))
+                    {
+                        notes[i].found = true;
+                        openedNote = i;
+                        noteOpen = true;
+                    }
+                }
+            }
+
+            if (showPickupMessage)
+            {
+                pickupMessageTimer -= deltaTime;
+
+                if (pickupMessageTimer <= 0.0f)
+                {
+                    pickupMessageTimer = 0.0f;
+                    showPickupMessage = false;
+                }
+            }
+        }
+
+        int hours = (int)(gameMinutes / 60.0f);
+        int minutes = (int)gameMinutes % 60;
+
+        TimePeriod timePeriod = GetTimePeriod(gameMinutes);
+        bool isNight = (timePeriod == TimePeriod::NIGHT);
+        Color skyColor = GetSkyColor(gameMinutes);
+        float nightDarkness = GetNightDarkness(gameMinutes);
+
+        BeginDrawing();
+        ClearBackground(skyColor);
+
+        BeginMode3D(camera);
+
+        DrawModel(ground, { 0.0f, 0.0f, 0.0f }, 1.0f, DARKGREEN);
+
+        DrawCube({ 0.0f, 0.01f, 100.0f }, 12.0f, 0.02f, 200.0f, BEIGE);
+        DrawCube({ 0.0f, 0.01f, -100.0f }, 12.0f, 0.02f, 200.0f, BEIGE);
+        DrawCube({ -100.0f, 0.012f, 35.0f }, 200.0f, 0.02f, 8.0f, BEIGE);
+        DrawCube({ 100.0f, 0.012f, 35.0f }, 200.0f, 0.02f, 8.0f, BEIGE);
+
+        for (int x = -240; x <= 240; x += 20)
+        {
+            for (int z = -240; z <= 240; z += 25)
+            {
+                if (fabsf((float)x) < 65.0f && fabsf((float)z) < 75.0f)
+                    continue;
+
+                Vector3 treePosition = { (float)x, 2.0f, (float)z };
+                float variation = 0.88f + 0.12f * sinf((float)(x * 13 + z * 7));
+
+                DrawModel(treeTrunk, treePosition, variation, BROWN);
+
+                Vector3 crown = treePosition;
+                crown.y += 3.0f * variation;
+                DrawModel(treeLeaves, crown, variation, DARKGREEN);
+            }
+        }
+
+        DrawCylinder({ 0.0f, 0.15f, 0.0f }, 1.5f, 1.5f, 0.3f, 12, DARKGRAY);
+
+        for (int i = 0; i < 8; i++)
+        {
+            float angle = i * (PI * 2.0f / 8.0f);
+            Vector3 stonePosition = { cosf(angle) * 2.0f, 0.25f, sinf(angle) * 2.0f };
+            DrawSphere(stonePosition, 0.35f, GRAY);
+        }
+
+        DrawSphere({ 0.0f, 0.9f, 0.0f }, 0.65f, ORANGE);
+        DrawSphere({ 0.0f, 1.35f, 0.0f }, 0.4f, YELLOW);
+
+        DrawModel(logModel, { -3.0f, 0.35f, 0.0f }, 1.0f, BROWN);
+        DrawModel(logModel, { 3.0f, 0.35f, 0.0f }, 1.0f, BROWN);
+
+        DrawCube({ -8.0f, 1.0f, 4.0f }, 5.0f, 2.0f, 6.0f, BEIGE);
+        DrawCube({ -8.0f, 2.1f, 4.0f }, 5.5f, 0.25f, 6.5f, DARKBROWN);
+
+        DrawCube({ 8.0f, 1.0f, 4.0f }, 5.0f, 2.0f, 6.0f, BEIGE);
+        DrawCube({ 8.0f, 2.1f, 4.0f }, 5.5f, 0.25f, 6.5f, DARKBROWN);
+
+        DrawModel(crateModel, { -4.0f, 0.6f, 7.0f }, 1.0f, BROWN);
+        DrawModel(crateModel, { -2.5f, 0.6f, 7.0f }, 1.0f, BROWN);
+        DrawModel(crateModel, { 4.0f, 0.6f, 7.0f }, 1.0f, BROWN);
+
+        // ===== LARGE MAIN BUILDING =====
+        const float mainHalfWidth = MAIN_BUILDING_WIDTH / 2.0f;
+        const float mainHalfDepth = MAIN_BUILDING_DEPTH / 2.0f;
+        const float mainFrontZ =
+            MAIN_BUILDING_Z - mainHalfDepth + MAIN_WALL_THICKNESS / 2.0f;
+        const float mainBackZ =
+            MAIN_BUILDING_Z + mainHalfDepth - MAIN_WALL_THICKNESS / 2.0f;
+        const float mainLeftX =
+            -mainHalfWidth + MAIN_WALL_THICKNESS / 2.0f;
+        const float mainRightX =
+            mainHalfWidth - MAIN_WALL_THICKNESS / 2.0f;
+
+        const float frontSegmentWidth =
+            (MAIN_BUILDING_WIDTH - MAIN_DOOR_WIDTH) / 2.0f;
+
+        const float frontLeftX =
+            -MAIN_DOOR_WIDTH / 2.0f - frontSegmentWidth / 2.0f;
+
+        const float frontRightX =
+            MAIN_DOOR_WIDTH / 2.0f + frontSegmentWidth / 2.0f;
+
+        DrawCube(
+            { 0.0f, 0.06f, MAIN_BUILDING_Z },
+            MAIN_BUILDING_WIDTH,
+            0.12f,
+            MAIN_BUILDING_DEPTH,
+            DARKBROWN
+        );
+
+        DrawCube(
+            { frontLeftX, MAIN_BUILDING_HEIGHT / 2.0f, mainFrontZ },
+            frontSegmentWidth,
+            MAIN_BUILDING_HEIGHT,
+            MAIN_WALL_THICKNESS,
+            BROWN
+        );
+
+        DrawCube(
+            { frontRightX, MAIN_BUILDING_HEIGHT / 2.0f, mainFrontZ },
+            frontSegmentWidth,
+            MAIN_BUILDING_HEIGHT,
+            MAIN_WALL_THICKNESS,
+            BROWN
+        );
+
+        DrawCube(
+            { 0.0f, MAIN_BUILDING_HEIGHT / 2.0f, mainBackZ },
+            MAIN_BUILDING_WIDTH,
+            MAIN_BUILDING_HEIGHT,
+            MAIN_WALL_THICKNESS,
+            BROWN
+        );
+
+        DrawCube(
+            { mainLeftX, MAIN_BUILDING_HEIGHT / 2.0f, MAIN_BUILDING_Z },
+            MAIN_WALL_THICKNESS,
+            MAIN_BUILDING_HEIGHT,
+            MAIN_BUILDING_DEPTH,
+            BROWN
+        );
+
+        DrawCube(
+            { mainRightX, MAIN_BUILDING_HEIGHT / 2.0f, MAIN_BUILDING_Z },
+            MAIN_WALL_THICKNESS,
+            MAIN_BUILDING_HEIGHT,
+            MAIN_BUILDING_DEPTH,
+            BROWN
+        );
+
+        DrawCube(
+            { 0.0f, MAIN_BUILDING_HEIGHT + 0.3f, MAIN_BUILDING_Z },
+            MAIN_BUILDING_WIDTH + 1.0f,
+            0.6f,
+            MAIN_BUILDING_DEPTH + 1.0f,
+            DARKGRAY
+        );
+
+        // Door: closed in the doorway, or slid to the side when open.
+        float doorX = mainDoorOpen ? 2.7f : 0.0f;
+
+        DrawCube(
+            { doorX, 1.3f, mainFrontZ },
+            MAIN_DOOR_WIDTH,
+            2.6f,
+            0.22f,
+            DARKBROWN
+        );
+
+        // Door frame.
+        DrawCube({ -1.35f, 1.35f, mainFrontZ - 0.02f }, 0.18f, 2.85f, 0.18f, BLACK);
+        DrawCube({  1.35f, 1.35f, mainFrontZ - 0.02f }, 0.18f, 2.85f, 0.18f, BLACK);
+        DrawCube({  0.0f, 2.72f, mainFrontZ - 0.02f }, 2.88f, 0.18f, 0.18f, BLACK);
+
+        // Windows on the large cabin.
+        DrawCube({ -4.0f, 2.0f, mainFrontZ - 0.04f }, 1.6f, 1.0f, 0.08f, SKYBLUE);
+        DrawCube({  4.0f, 2.0f, mainFrontZ - 0.04f }, 1.6f, 1.0f, 0.08f, SKYBLUE);
+
+        // Simple interior furniture so the building reads as a real room.
+        DrawCube({ -3.4f, 0.55f, 19.0f }, 2.4f, 1.0f, 1.1f, BROWN);
+        DrawCube({  3.4f, 0.55f, 19.0f }, 2.4f, 1.0f, 1.1f, BROWN);
+        DrawCube({  0.0f, 0.55f, 20.8f }, 3.0f, 1.0f, 1.2f, DARKBROWN);
+
+        // ===== LARGER DISTANT BUILDINGS =====
+        DrawCube({ -35.0f, 2.5f, 35.0f }, 16.0f, 5.0f, 12.0f, BROWN);
+        DrawCube({ -35.0f, 5.3f, 35.0f }, 17.0f, 0.6f, 13.0f, DARKGRAY);
+
+        DrawCube({ 35.0f, 2.5f, 35.0f }, 18.0f, 5.0f, 12.0f, BROWN);
+        DrawCube({ 35.0f, 5.3f, 35.0f }, 19.0f, 0.6f, 13.0f, DARKGRAY);
+
+        DrawCube({ -35.0f, 2.5f, -30.0f }, 12.0f, 5.0f, 10.0f, WHITE);
+        DrawCube({ -35.0f, 5.3f, -30.0f }, 13.0f, 0.6f, 11.0f, RED);
+
+        DrawCube({ 40.0f, 2.5f, -35.0f }, 12.0f, 5.0f, 10.0f, DARKBROWN);
+        DrawCube({ 40.0f, 5.3f, -35.0f }, 13.0f, 0.6f, 11.0f, DARKGRAY);
+
+        DrawCube({ 100.0f, 2.5f, 70.0f }, 16.0f, 5.0f, 14.0f, BROWN);
+        DrawCube({ 100.0f, 5.3f, 70.0f }, 17.0f, 0.6f, 15.0f, DARKGRAY);
+
+        DrawCube({ -100.0f, 2.5f, 80.0f }, 18.0f, 5.0f, 12.0f, BROWN);
+        DrawCube({ -100.0f, 5.3f, 80.0f }, 19.0f, 0.6f, 13.0f, DARKGRAY);
+
+        if (!itemCollected)
+        {
+            DrawCube(itemPosition, 0.6f, 0.6f, 0.6f, GOLD);
+            DrawCubeWires(itemPosition, 0.6f, 0.6f, 0.6f, BLACK);
+        }
+
+        for (int i = 0; i < NOTE_COUNT; i++)
+        {
+            if (!notes[i].found)
+            {
+                DrawCube(notes[i].position, 0.5f, 0.08f, 0.35f, WHITE);
+                DrawCubeWires(notes[i].position, 0.5f, 0.08f, 0.35f, BLACK);
+            }
+        }
+
+        if (flashlight)
+        {
+            Vector3 direction = Vector3Subtract(camera.target, camera.position);
+
+            if (Vector3Length(direction) > 0.001f)
+                direction = Vector3Normalize(direction);
+
+            Vector3 lightPosition = Vector3Add(
+                camera.position,
+                Vector3Scale(direction, 1.0f)
+            );
+
+            DrawSphere(lightPosition, 0.05f, YELLOW);
+        }
+
+        EndMode3D();
+
+        // Smooth darkness transition based on the new game clock.
+        if (nightDarkness > 0.001f)
+            DrawRectangle(
+                0, 0,
+                SCREEN_WIDTH,
+                SCREEN_HEIGHT,
+                ColorAlpha(BLACK, nightDarkness)
+            );
+
+        // Small day-change banner.
+        if (dayBannerTimer > 0.0f)
+        {
+            const char* bannerText = TextFormat("DAY %d / %d", currentDay, TOTAL_DAYS);
+            int bannerWidth = MeasureText(bannerText, 38);
+
+            DrawRectangle(
+                SCREEN_WIDTH / 2 - 220,
+                55,
+                440,
+                100,
+                ColorAlpha(BLACK, 0.78f)
+            );
+
+            DrawRectangleLines(
+                SCREEN_WIDTH / 2 - 220,
+                55,
+                440,
+                100,
+                WHITE
+            );
+
+            DrawText(
+                bannerText,
+                SCREEN_WIDTH / 2 - bannerWidth / 2,
+                85,
+                38,
+                WHITE
+            );
+        }
+
+        if (!noteOpen && !journalOpen)
+        {
+            DrawRectangle(0, 0, 330, 185, ColorAlpha(BLACK, 0.35f));
+
+            DrawText("DO RASSVETA", 20, 20, 30, WHITE);
+            DrawText("INVESTIGATION", 20, 188, 18, GRAY);
+            DrawText(TextFormat("DAY %d / %d", currentDay, TOTAL_DAYS), 20, 60, 24, WHITE);
+            DrawText(TextFormat("%02d:%02d", hours, minutes), 20, 90, 32, WHITE);
+            DrawText(GetTimePeriodText(timePeriod), 20, 128, 20, WHITE);
+            DrawText(flashlight ? "FLASHLIGHT: ON" : "FLASHLIGHT: OFF", 20, 158, 20, WHITE);
+
+            DrawText(
+                playerInsideMainBuilding ? "LOCATION: MAIN BUILDING" : "LOCATION: CAMP",
+                20, 184, 18, playerInsideMainBuilding ? LIGHTGRAY : GRAY
+            );
+
+            // Current story objective.
+            DrawRectangle(15, 205, 500, 62, ColorAlpha(BLACK, 0.50f));
+            DrawText("OBJECTIVE", 25, 215, 16, GRAY);
+            DrawText(storyObjective, 25, 236, 19, WHITE);
+
+            if (lookingAtMainDoor)
+            {
+                const char* text = mainDoorOpen ? "[E] CLOSE DOOR" : "[E] OPEN DOOR";
+                int textWidth = MeasureText(text, 25);
+
+                DrawText(
+                    text,
+                    SCREEN_WIDTH / 2 - textWidth / 2,
+                    SCREEN_HEIGHT / 2 + 40,
+                    25,
+                    WHITE
+                );
+            }
+
+            if (!lookingAtMainDoor)
+            {
+                for (int i = 0; i < NOTE_COUNT; i++)
+                {
+                    if (!notes[i].found &&
+                        IsNearAndLookingAt(camera, notes[i].position, 3.0f, 0.75f))
+                    {
+                        const char* text = "[E] READ NOTE";
+                        int textWidth = MeasureText(text, 25);
+
+                        DrawText(
+                            text,
+                            SCREEN_WIDTH / 2 - textWidth / 2,
+                            SCREEN_HEIGHT / 2 + 40,
+                            25,
+                            WHITE
+                        );
+                    }
+                }
+            }
+
+            if (!lookingAtMainDoor && lookingAtItem)
+            {
+                const char* text = "[E] PICK UP";
+                int textWidth = MeasureText(text, 25);
+
+                DrawText(
+                    text,
+                    SCREEN_WIDTH / 2 - textWidth / 2,
+                    SCREEN_HEIGHT / 2 + 40,
+                    25,
+                    WHITE
+                );
+            }
+
+            if (showPickupMessage)
+            {
+                const char* text = "ITEM PICKED UP";
+                int textWidth = MeasureText(text, 30);
+
+                DrawText(
+                    text,
+                    SCREEN_WIDTH / 2 - textWidth / 2,
+                    SCREEN_HEIGHT - 100,
+                    30,
+                    WHITE
+                );
+            }
+
+            int centerX = SCREEN_WIDTH / 2;
+            int centerY = SCREEN_HEIGHT / 2;
+
+            DrawLine(centerX - 6, centerY, centerX + 6, centerY, WHITE);
+            DrawLine(centerX, centerY - 6, centerX, centerY + 6, WHITE);
+
+            DrawText("WASD - move", 20, SCREEN_HEIGHT - 160, 18, WHITE);
+            DrawText("SHIFT - run", 20, SCREEN_HEIGHT - 135, 18, WHITE);
+            DrawText("SPACE - jump", 20, SCREEN_HEIGHT - 110, 18, WHITE);
+            DrawText("E - interact / doors", 20, SCREEN_HEIGHT - 85, 18, WHITE);
+            DrawText("F - flashlight", 20, SCREEN_HEIGHT - 60, 18, WHITE);
+            DrawText("TAB - journal", 20, SCREEN_HEIGHT - 35, 18, WHITE);
+
+            if (gameFinished)
+            {
+                DrawText(
+                    "7-DAY CLOCK COMPLETE",
+                    SCREEN_WIDTH - 300,
+                    25,
+                    20,
+                    LIGHTGRAY
+                );
+            }
+        }
+
+        // Story message panel.
+        if (storyMessageTimer > 0.0f && !noteOpen && !journalOpen)
+        {
+            DrawRectangle(
+                330,
+                SCREEN_HEIGHT - 180,
+                SCREEN_WIDTH - 660,
+                105,
+                ColorAlpha(BLACK, 0.82f)
+            );
+
+            DrawRectangleLines(
+                330,
+                SCREEN_HEIGHT - 180,
+                SCREEN_WIDTH - 660,
+                105,
+                ColorAlpha(WHITE, 0.65f)
+            );
+
+            DrawText(
+                storyTitle,
+                355,
+                SCREEN_HEIGHT - 162,
+                22,
+                WHITE
+            );
+
+            DrawText(
+                storyMessage,
+                355,
+                SCREEN_HEIGHT - 128,
+                18,
+                LIGHTGRAY
+            );
+        }
+
+        // Story marker after the disappearance.
+        if (colleaguesGone && currentDay == 1 && !noteOpen && !journalOpen)
+        {
+            DrawText(
+                "7 OFFICERS MISSING",
+                SCREEN_WIDTH - 250,
+                90,
+                18,
+                LIGHTGRAY
+            );
+        }
+
+        if (noteOpen && openedNote >= 0)
+        {
+            DrawRectangle(
+                120, 70,
+                SCREEN_WIDTH - 240,
+                SCREEN_HEIGHT - 140,
+                ColorAlpha(BLACK, 0.92f)
+            );
+
+            DrawRectangleLines(
+                120, 70,
+                SCREEN_WIDTH - 240,
+                SCREEN_HEIGHT - 140,
+                WHITE
+            );
+
+            DrawText(notes[openedNote].title, 160, 110, 32, WHITE);
+            DrawText(notes[openedNote].text, 160, 170, 22, LIGHTGRAY);
+
+            DrawText(
+                TextFormat("Найдено: день %d", currentDay),
+                160, SCREEN_HEIGHT - 150,
+                18, GRAY
+            );
+
+            DrawText(
+                "[E] / [ESC] CLOSE",
+                SCREEN_WIDTH - 330,
+                SCREEN_HEIGHT - 110,
+                20, WHITE
+            );
+        }
+
+        if (journalOpen)
+        {
+            DrawRectangle(
+                100, 50,
+                SCREEN_WIDTH - 200,
+                SCREEN_HEIGHT - 100,
+                ColorAlpha(BLACK, 0.95f)
+            );
+
+            DrawRectangleLines(
+                100, 50,
+                SCREEN_WIDTH - 200,
+                SCREEN_HEIGHT - 100,
+                WHITE
+            );
+
+            DrawText("ЖУРНАЛ РАССЛЕДОВАНИЯ", 140, 90, 32, WHITE);
+
+            int journalY = 150;
+            bool anyFound = false;
+
+            for (int i = 0; i < NOTE_COUNT; i++)
+            {
+                if (notes[i].found)
+                {
+                    anyFound = true;
+
+                    DrawText(
+                        TextFormat("%d. %s", i + 1, notes[i].title),
+                        150, journalY, 22, WHITE
+                    );
+
+                    journalY += 35;
+
+                    DrawText(
+                        "Запись найдена.",
+                        180, journalY, 17, LIGHTGRAY
+                    );
+
+                    journalY += 45;
+                }
+            }
+
+            if (!anyFound)
+                DrawText("Пока ничего не найдено.", 150, journalY, 22, LIGHTGRAY);
+
+            DrawText(
+                "[TAB] / [ESC] CLOSE",
+                SCREEN_WIDTH - 330,
+                SCREEN_HEIGHT - 90,
+                20, WHITE
+            );
+        }
+
+        EndDrawing();
+    }
+
+    UnloadModel(ground);
+    UnloadModel(treeTrunk);
+    UnloadModel(treeLeaves);
+    UnloadModel(tentBody);
+    UnloadModel(crateModel);
+    UnloadModel(logModel);
+
+    CloseWindow();
+    return 0;
+}
