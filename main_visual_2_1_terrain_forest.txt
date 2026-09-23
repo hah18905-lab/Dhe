@@ -1,0 +1,1047 @@
+#include "raylib.h"
+#include "raymath.h"
+#include <cmath>
+#include <algorithm>
+
+// ============================================================
+// DO RASSVETA - VISUAL 2.1 / PBR-LITE PROTOTYPE
+// ------------------------------------------------------------
+// This is a separate visual test. It does NOT replace the main
+// story/menu/pause code yet. The goal is to judge the new visual
+// foundation before merging it into the main game.
+//
+// Controls:
+//   WASD       - move
+//   SHIFT      - run
+//   Mouse      - look
+//   F          - flashlight
+//   1          - daytime
+//   2          - evening
+//   3          - night
+//   ESC        - close
+// ============================================================
+
+static float ClampF(float v, float a, float b)
+{
+    return (v < a) ? a : ((v > b) ? b : v);
+}
+
+static float LerpF(float a, float b, float t)
+{
+    return a + (b - a) * t;
+}
+
+static Color MixColor(Color a, Color b, float t)
+{
+    t = ClampF(t, 0.0f, 1.0f);
+    return {
+        (unsigned char)ClampF(LerpF((float)a.r, (float)b.r, t), 0.0f, 255.0f),
+        (unsigned char)ClampF(LerpF((float)a.g, (float)b.g, t), 0.0f, 255.0f),
+        (unsigned char)ClampF(LerpF((float)a.b, (float)b.b, t), 0.0f, 255.0f),
+        255
+    };
+}
+
+static unsigned int HashU32(unsigned int x)
+{
+    x += 0x6D2B79F5u;
+    x = (x ^ (x >> 15)) * (x | 1u);
+    x ^= x + ((x ^ (x >> 7)) * (x | 61u));
+    return x ^ (x >> 14);
+}
+
+static float Hash01(int x, int y, int seed = 0)
+{
+    unsigned int h = HashU32((unsigned int)(x * 374761393 + y * 668265263 + seed * 362437));
+    return (float)(h & 0x00FFFFFFu) / 16777215.0f;
+}
+
+static float Fade(float t)
+{
+    return t * t * (3.0f - 2.0f * t);
+}
+
+static float ValueNoise(float x, float y, int seed = 0)
+{
+    int x0 = (int)floorf(x);
+    int y0 = (int)floorf(y);
+    int x1 = x0 + 1;
+    int y1 = y0 + 1;
+
+    float tx = Fade(x - (float)x0);
+    float ty = Fade(y - (float)y0);
+
+    float a = Hash01(x0, y0, seed);
+    float b = Hash01(x1, y0, seed);
+    float c = Hash01(x0, y1, seed);
+    float d = Hash01(x1, y1, seed);
+
+    float ab = LerpF(a, b, tx);
+    float cd = LerpF(c, d, tx);
+    return LerpF(ab, cd, ty);
+}
+
+static float FBM(float x, float y, int seed = 0)
+{
+    float value = 0.0f;
+    float amplitude = 0.5f;
+    float frequency = 1.0f;
+    float totalAmplitude = 0.0f;
+
+    for (int i = 0; i < 5; ++i)
+    {
+        value += ValueNoise(x * frequency, y * frequency, seed + i * 37) * amplitude;
+        totalAmplitude += amplitude;
+        amplitude *= 0.5f;
+        frequency *= 2.0f;
+    }
+
+    return value / totalAmplitude;
+}
+
+static Image CreateGroundTexture(int width, int height)
+{
+    Image image = GenImageColor(width, height, WHITE);
+    Color* pixels = (Color*)image.data;
+
+    for (int y = 0; y < height; ++y)
+    {
+        for (int x = 0; x < width; ++x)
+        {
+            float u = (float)x / (float)width;
+            float v = (float)y / (float)height;
+
+            float nLarge = FBM(u * 7.0f, v * 7.0f, 10);
+            float nSmall = FBM(u * 35.0f, v * 35.0f, 21);
+            float grass = ValueNoise(u * 80.0f, v * 80.0f, 44);
+
+            Color soilA = { 52, 44, 32, 255 };
+            Color soilB = { 83, 70, 49, 255 };
+            Color mossA = { 40, 57, 31, 255 };
+            Color mossB = { 68, 82, 40, 255 };
+
+            Color c = MixColor(soilA, soilB, nSmall);
+            float mossMask = ClampF((nLarge - 0.42f) * 1.7f, 0.0f, 1.0f) * 0.50f;
+            c = MixColor(c, MixColor(mossA, mossB, grass), mossMask);
+
+            // Sparse dead-leaf / twig spots.
+            float debris = ValueNoise(u * 150.0f, v * 150.0f, 83);
+            if (debris > 0.86f)
+            {
+                c.r = (unsigned char)ClampF((float)c.r + 20.0f, 0.0f, 255.0f);
+                c.g = (unsigned char)ClampF((float)c.g + 8.0f, 0.0f, 255.0f);
+                c.b = (unsigned char)ClampF((float)c.b - 6.0f, 0.0f, 255.0f);
+            }
+
+            pixels[y * width + x] = c;
+        }
+    }
+
+    return image;
+}
+
+static Image CreateWoodTexture(int width, int height)
+{
+    Image image = GenImageColor(width, height, WHITE);
+    Color* pixels = (Color*)image.data;
+
+    for (int y = 0; y < height; ++y)
+    {
+        float plankPos = fmodf((float)y / (float)height * 7.0f, 1.0f);
+        bool seam = plankPos < 0.035f || plankPos > 0.965f;
+
+        for (int x = 0; x < width; ++x)
+        {
+            float u = (float)x / (float)width;
+            float v = (float)y / (float)height;
+
+            float grain = FBM(u * 15.0f, v * 2.5f, 101);
+            float fine = FBM(u * 60.0f, v * 8.0f, 121);
+            float knots = ValueNoise(u * 12.0f, v * 12.0f, 171);
+
+            Color dry = { 88, 62, 40, 255 };
+            Color warm = { 124, 82, 50, 255 };
+            Color moss = { 64, 75, 46, 255 };
+
+            Color c = MixColor(dry, warm, grain);
+
+            if (knots > 0.84f)
+                c = MixColor(c, { 54, 38, 27, 255 }, (knots - 0.84f) * 4.0f);
+
+            if (fine > 0.76f)
+                c = MixColor(c, { 45, 48, 31, 255 }, 0.24f);
+
+            if (seam)
+                c = MixColor(c, { 28, 23, 19, 255 }, 0.75f);
+
+            // Very subtle mossy aging.
+            float aging = ValueNoise(u * 25.0f, v * 25.0f, 190);
+            if (aging > 0.89f)
+                c = MixColor(c, moss, 0.22f);
+
+            pixels[y * width + x] = c;
+        }
+    }
+
+    return image;
+}
+
+static Image CreateBarkTexture(int width, int height)
+{
+    Image image = GenImageColor(width, height, WHITE);
+    Color* pixels = (Color*)image.data;
+
+    for (int y = 0; y < height; ++y)
+    {
+        for (int x = 0; x < width; ++x)
+        {
+            float u = (float)x / (float)width;
+            float v = (float)y / (float)height;
+            float vertical = 0.5f + 0.5f * sinf(u * 55.0f + FBM(u * 6.0f, v * 3.0f, 211) * 4.0f);
+            float rough = FBM(u * 20.0f, v * 18.0f, 227);
+
+            Color a = { 40, 27, 20, 255 };
+            Color b = { 83, 55, 35, 255 };
+            Color c = MixColor(a, b, vertical * 0.7f + rough * 0.3f);
+
+            if (vertical < 0.23f)
+                c = MixColor(c, { 25, 20, 16, 255 }, 0.55f);
+
+            pixels[y * width + x] = c;
+        }
+    }
+
+    return image;
+}
+
+static Image CreateLeafTexture(int width, int height)
+{
+    Image image = GenImageColor(width, height, WHITE);
+    Color* pixels = (Color*)image.data;
+
+    for (int y = 0; y < height; ++y)
+    {
+        for (int x = 0; x < width; ++x)
+        {
+            float u = (float)x / (float)width;
+            float v = (float)y / (float)height;
+            float n = FBM(u * 12.0f, v * 12.0f, 241);
+
+            Color dark = { 16, 34, 17, 255 };
+            Color light = { 54, 81, 35, 255 };
+            Color c = MixColor(dark, light, n);
+
+            pixels[y * width + x] = c;
+        }
+    }
+
+    return image;
+}
+
+static Image CreateMetalTexture(int width, int height)
+{
+    Image image = GenImageColor(width, height, WHITE);
+    Color* pixels = (Color*)image.data;
+
+    for (int y = 0; y < height; ++y)
+    {
+        for (int x = 0; x < width; ++x)
+        {
+            float u = (float)x / (float)width;
+            float v = (float)y / (float)height;
+            float base = FBM(u * 9.0f, v * 9.0f, 301);
+            float rust = FBM(u * 18.0f, v * 7.0f, 317);
+            float streak = 0.5f + 0.5f * sinf(v * 90.0f + rust * 3.0f);
+
+            Color steel = { 67, 72, 73, 255 };
+            Color oxidized = { 80, 50, 34, 255 };
+
+            Color c = MixColor({ 42, 48, 50, 255 }, steel, base);
+            float rustMask = ClampF((rust - 0.60f) * 2.8f, 0.0f, 1.0f) * 0.8f * streak;
+            c = MixColor(c, oxidized, rustMask);
+
+            pixels[y * width + x] = c;
+        }
+    }
+
+    return image;
+}
+
+
+// ------------------------------------------------------------
+// VISUAL 2.1 - PROCEDURAL TERRAIN / GROUNDED FOREST
+// ------------------------------------------------------------
+static constexpr float TERRAIN_SIZE = 420.0f;
+static constexpr float TERRAIN_BASE_Y = -2.5f;
+static constexpr float TERRAIN_HEIGHT = 5.0f;
+
+static float SmoothStep(float edge0, float edge1, float x);
+
+static void DrawModelScaled(Model& model, Vector3 position, Vector3 scale, Color tint);
+
+static float TerrainNormalizedHeight(float worldX, float worldZ)
+{
+    // Stable broad terrain shape.
+    float broad = FBM(worldX * 0.018f, worldZ * 0.018f, 401);
+    float medium = FBM(worldX * 0.045f, worldZ * 0.045f, 417);
+    float detail = FBM(worldX * 0.11f, worldZ * 0.11f, 433);
+
+    float n = broad * 0.58f + medium * 0.30f + detail * 0.12f;
+
+    // Flatten the central camp so the important gameplay space stays readable.
+    float d = sqrtf(worldX * worldX + worldZ * worldZ);
+    float flatten = 1.0f - SmoothStep(38.0f, 70.0f, d);
+    n = LerpF(n, 0.50f, flatten * 0.88f);
+
+    // A subtle low area near the campfire / central clearing.
+    float clearing = 1.0f - SmoothStep(12.0f, 30.0f, sqrtf(worldX * worldX + (worldZ + 1.0f) * (worldZ + 1.0f)));
+    n -= clearing * 0.018f;
+
+    return ClampF(n, 0.05f, 0.95f);
+}
+
+// Same height function used by both the heightmap and object placement,
+// so trees/rocks/logs always meet the terrain surface.
+static float GetTerrainHeight(float worldX, float worldZ)
+{
+    return TERRAIN_BASE_Y + TerrainNormalizedHeight(worldX, worldZ) * TERRAIN_HEIGHT;
+}
+
+static float SmoothStep(float edge0, float edge1, float x)
+{
+    x = ClampF((x - edge0) / (edge1 - edge0), 0.0f, 1.0f);
+    return x * x * (3.0f - 2.0f * x);
+}
+
+static Image CreateTerrainHeightmap(int width, int height)
+{
+    Image image = GenImageColor(width, height, WHITE);
+    Color* pixels = (Color*)image.data;
+
+    for (int z = 0; z < height; ++z)
+    {
+        for (int x = 0; x < width; ++x)
+        {
+            float u = (float)x / (float)(width - 1);
+            float v = (float)z / (float)(height - 1);
+            float worldX = (u - 0.5f) * TERRAIN_SIZE;
+            float worldZ = (v - 0.5f) * TERRAIN_SIZE;
+
+            float h = TerrainNormalizedHeight(worldX, worldZ);
+            unsigned char g = (unsigned char)ClampF(h * 255.0f, 0.0f, 255.0f);
+            pixels[z * width + x] = { g, g, g, 255 };
+        }
+    }
+
+    return image;
+}
+
+static void DrawPineTree(Model& trunk, Model& crown, Shader shader,
+                         int uvScaleLoc, int roughnessLoc, int metallicLoc,
+                         Vector3 position, float heightScale, float radiusScale, float yaw)
+{
+    const float groundY = GetTerrainHeight(position.x, position.z);
+
+    // Slightly sink the trunk into the terrain to guarantee zero visible gap.
+    const float trunkHeight = 3.5f * heightScale;
+    const float trunkRadiusScale = 0.80f * radiusScale;
+    const float trunkCenterY = groundY + trunkHeight * 0.5f - 0.30f;
+
+    SetMaterialParams(shader, uvScaleLoc, roughnessLoc, metallicLoc,
+                      1.2f, 2.8f, 0.92f, 0.0f);
+    DrawModelEx(trunk,
+                { position.x, trunkCenterY, position.z },
+                { 0.0f, 1.0f, 0.0f },
+                yaw,
+                { trunkRadiusScale, trunkHeight, trunkRadiusScale },
+                WHITE);
+
+    // Root flare / dirt contact. It deliberately intersects the terrain.
+    SetMaterialParams(shader, uvScaleLoc, roughnessLoc, metallicLoc,
+                      1.0f, 1.0f, 0.98f, 0.0f);
+    DrawModelScaled(trunk,
+                    { position.x, groundY + 0.12f, position.z },
+                    { 1.55f * radiusScale, 0.22f, 1.55f * radiusScale },
+                    WHITE);
+
+    // Layered conifer crown; overlap keeps the tree organic and hides seams.
+    SetMaterialParams(shader, uvScaleLoc, roughnessLoc, metallicLoc,
+                      1.0f, 1.0f, 0.97f, 0.0f);
+
+    float crownBase = groundY + trunkHeight * 0.60f;
+    float c1 = 1.75f * radiusScale;
+    float c2 = 1.38f * radiusScale;
+    float c3 = 1.02f * radiusScale;
+    float c4 = 0.68f * radiusScale;
+
+    DrawModelEx(crown,
+                { position.x, crownBase + 0.55f * heightScale, position.z },
+                { 0.0f, 1.0f, 0.0f }, yaw,
+                { c1, 1.55f * heightScale, c1 }, WHITE);
+
+    DrawModelEx(crown,
+                { position.x, crownBase + 1.65f * heightScale, position.z },
+                { 0.0f, 1.0f, 0.0f }, yaw,
+                { c2, 1.45f * heightScale, c2 }, WHITE);
+
+    DrawModelEx(crown,
+                { position.x, crownBase + 2.65f * heightScale, position.z },
+                { 0.0f, 1.0f, 0.0f }, yaw,
+                { c3, 1.30f * heightScale, c3 }, WHITE);
+
+    DrawModelEx(crown,
+                { position.x, crownBase + 3.55f * heightScale, position.z },
+                { 0.0f, 1.0f, 0.0f }, yaw,
+                { c4, 1.10f * heightScale, c4 }, WHITE);
+}
+
+static const char* VisualVS = R"GLSL(
+#version 330
+
+in vec3 vertexPosition;
+in vec2 vertexTexCoord;
+in vec3 vertexNormal;
+in vec4 vertexColor;
+
+uniform mat4 mvp;
+uniform mat4 matModel;
+uniform mat4 matNormal;
+uniform vec2 uvScale;
+
+out vec3 fragPosition;
+out vec2 fragTexCoord;
+out vec3 fragNormal;
+out vec4 fragColor;
+
+void main()
+{
+    fragPosition = vec3(matModel * vec4(vertexPosition, 1.0));
+    fragTexCoord = vertexTexCoord * uvScale;
+    fragNormal = normalize(vec3(matNormal * vec4(vertexNormal, 0.0)));
+    fragColor = vertexColor;
+    gl_Position = mvp * vec4(vertexPosition, 1.0);
+}
+)GLSL";
+
+static const char* VisualFS = R"GLSL(
+#version 330
+
+in vec3 fragPosition;
+in vec2 fragTexCoord;
+in vec3 fragNormal;
+in vec4 fragColor;
+
+uniform sampler2D texture0;
+uniform vec4 colDiffuse;
+
+uniform vec3 viewPos;
+uniform vec3 sunDirection;
+uniform vec3 sunColor;
+uniform float sunIntensity;
+uniform vec3 ambientColor;
+uniform float ambientStrength;
+
+uniform vec3 firePosition;
+uniform vec3 fireColor;
+uniform float fireIntensity;
+uniform float fireRadius;
+
+uniform vec3 flashPosition;
+uniform vec3 flashDirection;
+uniform float flashEnabled;
+uniform float flashIntensity;
+uniform float flashRange;
+
+uniform vec3 fogColor;
+uniform float fogNear;
+uniform float fogFar;
+
+uniform float materialRoughness;
+uniform float materialMetallic;
+
+out vec4 finalColor;
+
+float DistributionGGX(vec3 N, vec3 H, float roughness)
+{
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float NdotH = max(dot(N, H), 0.0);
+    float NdotH2 = NdotH * NdotH;
+
+    float num = a2;
+    float den = (NdotH2 * (a2 - 1.0) + 1.0);
+    den = 3.14159265 * den * den;
+    return num / max(den, 0.0001);
+}
+
+float GeometrySchlickGGX(float NdotV, float roughness)
+{
+    float r = roughness + 1.0;
+    float k = (r * r) / 8.0;
+    return NdotV / max(NdotV * (1.0 - k) + k, 0.0001);
+}
+
+float GeometrySmith(vec3 N, vec3 V, vec3 L, float roughness)
+{
+    float NdotV = max(dot(N, V), 0.0);
+    float NdotL = max(dot(N, L), 0.0);
+    return GeometrySchlickGGX(NdotV, roughness) * GeometrySchlickGGX(NdotL, roughness);
+}
+
+vec3 FresnelSchlick(float cosTheta, vec3 F0)
+{
+    return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
+}
+
+vec3 EvaluateLight(vec3 N, vec3 V, vec3 L, vec3 radiance, vec3 baseColor, float roughness, float metallic)
+{
+    float NdotL = max(dot(N, L), 0.0);
+    if (NdotL <= 0.0) return vec3(0.0);
+
+    vec3 H = normalize(V + L);
+    vec3 F0 = mix(vec3(0.04), baseColor, metallic);
+    vec3 F = FresnelSchlick(max(dot(H, V), 0.0), F0);
+    float D = DistributionGGX(N, H, roughness);
+    float G = GeometrySmith(N, V, L, roughness);
+
+    vec3 numerator = D * G * F;
+    float denominator = 4.0 * max(dot(N, V), 0.0) * NdotL + 0.001;
+    vec3 specular = numerator / denominator;
+    vec3 diffuse = (1.0 - F) * (1.0 - metallic) * baseColor / 3.14159265;
+
+    return (diffuse + specular) * radiance * NdotL;
+}
+
+void main()
+{
+    vec4 texel = texture(texture0, fragTexCoord);
+    vec3 baseColor = texel.rgb * colDiffuse.rgb * fragColor.rgb;
+
+    vec3 N = normalize(fragNormal);
+    vec3 V = normalize(viewPos - fragPosition);
+
+    float roughness = clamp(materialRoughness, 0.06, 1.0);
+    float metallic = clamp(materialMetallic, 0.0, 1.0);
+
+    vec3 color = baseColor * ambientColor * ambientStrength;
+
+    // Sun / moon.
+    vec3 Lsun = normalize(-sunDirection);
+    color += EvaluateLight(N, V, Lsun, sunColor * sunIntensity, baseColor, roughness, metallic);
+
+    // Campfire point light.
+    vec3 fireVector = firePosition - fragPosition;
+    float fireDist = length(fireVector);
+    if (fireDist < fireRadius)
+    {
+        vec3 Lfire = normalize(fireVector);
+        float falloff = pow(1.0 - fireDist / fireRadius, 2.0);
+        vec3 radiance = fireColor * fireIntensity * falloff;
+        color += EvaluateLight(N, V, Lfire, radiance, baseColor, roughness, metallic);
+    }
+
+    // Flashlight spotlight.
+    if (flashEnabled > 0.5)
+    {
+        vec3 toSurface = fragPosition - flashPosition;
+        float d = length(toSurface);
+        if (d < flashRange)
+        {
+            vec3 fromFlash = normalize(toSurface);
+            float cone = dot(normalize(flashDirection), fromFlash);
+            float coneMask = smoothstep(0.55, 0.88, cone);
+            float attenuation = pow(1.0 - d / flashRange, 1.7) * coneMask;
+            vec3 Lflash = normalize(flashPosition - fragPosition);
+            color += EvaluateLight(N, V, Lflash, vec3(1.0, 0.95, 0.82) * flashIntensity * attenuation, baseColor, roughness, metallic);
+        }
+    }
+
+    // Mild exposure / tone mapping.
+    color = color / (color + vec3(1.0));
+    color = pow(color, vec3(1.0 / 2.2));
+
+    float distanceToCamera = length(viewPos - fragPosition);
+    float fog = smoothstep(fogNear, fogFar, distanceToCamera);
+    color = mix(color, fogColor, fog);
+
+    finalColor = vec4(color, texel.a * colDiffuse.a * fragColor.a);
+}
+)GLSL";
+
+static void ApplyTexture(Model& model, Texture2D texture)
+{
+    for (int i = 0; i < model.materialCount; ++i)
+    {
+        model.materials[i].maps[MATERIAL_MAP_DIFFUSE].texture = texture;
+        model.materials[i].maps[MATERIAL_MAP_DIFFUSE].color = WHITE;
+    }
+}
+
+static void ApplyShader(Model& model, Shader shader)
+{
+    for (int i = 0; i < model.materialCount; ++i)
+        model.materials[i].shader = shader;
+}
+
+static void SetMaterialParams(Shader shader, int uvScaleLoc, int roughnessLoc, int metallicLoc,
+                              float uvX, float uvY, float roughness, float metallic)
+{
+    float uv[2] = { uvX, uvY };
+    SetShaderValue(shader, uvScaleLoc, uv, SHADER_UNIFORM_VEC2);
+    SetShaderValue(shader, roughnessLoc, &roughness, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(shader, metallicLoc, &metallic, SHADER_UNIFORM_FLOAT);
+}
+
+static void DrawModelScaled(Model& model, Vector3 position, Vector3 scale, Color tint)
+{
+    DrawModelEx(model,
+                position,
+                { 0.0f, 1.0f, 0.0f },
+                0.0f,
+                scale,
+                tint);
+}
+
+int main()
+{
+    const int screenWidth = 1280;
+    const int screenHeight = 720;
+
+    // Correct order: graphics flags BEFORE InitWindow.
+    SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_VSYNC_HINT);
+    InitWindow(screenWidth, screenHeight, "Do Rassveta - VISUAL 2.0");
+    SetTargetFPS(60);
+    DisableCursor();
+
+    Camera3D camera = { 0 };
+    camera.position = { 0.0f, 2.0f, -14.0f };
+    camera.target = { 0.0f, 1.9f, 0.0f };
+    camera.up = { 0.0f, 1.0f, 0.0f };
+    camera.fovy = 72.0f;
+    camera.projection = CAMERA_PERSPECTIVE;
+
+    // ------------------------------------------------------------
+    // Procedural material textures: much less synthetic than the
+    // previous sine-wave test and designed for tiling.
+    // ------------------------------------------------------------
+    Image groundImage = CreateGroundTexture(512, 512);
+    Image woodImage = CreateWoodTexture(512, 512);
+    Image barkImage = CreateBarkTexture(512, 512);
+    Image leafImage = CreateLeafTexture(512, 512);
+    Image metalImage = CreateMetalTexture(512, 512);
+
+    Texture2D groundTexture = LoadTextureFromImage(groundImage);
+    Texture2D woodTexture = LoadTextureFromImage(woodImage);
+    Texture2D barkTexture = LoadTextureFromImage(barkImage);
+    Texture2D leafTexture = LoadTextureFromImage(leafImage);
+    Texture2D metalTexture = LoadTextureFromImage(metalImage);
+
+    UnloadImage(groundImage);
+    UnloadImage(woodImage);
+    UnloadImage(barkImage);
+    UnloadImage(leafImage);
+    UnloadImage(metalImage);
+
+    Texture2D* textures[] = { &groundTexture, &woodTexture, &barkTexture, &leafTexture, &metalTexture };
+    for (Texture2D* texture : textures)
+    {
+        GenTextureMipmaps(texture);
+        SetTextureFilter(*texture, TEXTURE_FILTER_TRILINEAR);
+        SetTextureWrap(*texture, TEXTURE_WRAP_REPEAT);
+    }
+
+    Shader shader = LoadShaderFromMemory(VisualVS, VisualFS);
+
+    int viewPosLoc = GetShaderLocation(shader, "viewPos");
+    int sunDirectionLoc = GetShaderLocation(shader, "sunDirection");
+    int sunColorLoc = GetShaderLocation(shader, "sunColor");
+    int sunIntensityLoc = GetShaderLocation(shader, "sunIntensity");
+    int ambientColorLoc = GetShaderLocation(shader, "ambientColor");
+    int ambientStrengthLoc = GetShaderLocation(shader, "ambientStrength");
+    int firePositionLoc = GetShaderLocation(shader, "firePosition");
+    int fireColorLoc = GetShaderLocation(shader, "fireColor");
+    int fireIntensityLoc = GetShaderLocation(shader, "fireIntensity");
+    int fireRadiusLoc = GetShaderLocation(shader, "fireRadius");
+    int flashPositionLoc = GetShaderLocation(shader, "flashPosition");
+    int flashDirectionLoc = GetShaderLocation(shader, "flashDirection");
+    int flashEnabledLoc = GetShaderLocation(shader, "flashEnabled");
+    int flashIntensityLoc = GetShaderLocation(shader, "flashIntensity");
+    int flashRangeLoc = GetShaderLocation(shader, "flashRange");
+    int fogColorLoc = GetShaderLocation(shader, "fogColor");
+    int fogNearLoc = GetShaderLocation(shader, "fogNear");
+    int fogFarLoc = GetShaderLocation(shader, "fogFar");
+    int uvScaleLoc = GetShaderLocation(shader, "uvScale");
+    int roughnessLoc = GetShaderLocation(shader, "materialRoughness");
+    int metallicLoc = GetShaderLocation(shader, "materialMetallic");
+
+    // ------------------------------------------------------------
+    // Reusable meshes/models.
+    // ------------------------------------------------------------
+    Image terrainHeightmap = CreateTerrainHeightmap(192, 192);
+    Mesh terrainMesh = GenMeshHeightmap(terrainHeightmap, { TERRAIN_SIZE, TERRAIN_HEIGHT, TERRAIN_SIZE });
+    UnloadImage(terrainHeightmap);
+    Model ground = LoadModelFromMesh(terrainMesh);
+    Model unitCube = LoadModelFromMesh(GenMeshCube(1.0f, 1.0f, 1.0f));
+    Model trunk = LoadModelFromMesh(GenMeshCylinder(0.28f, 1.0f, 10));
+    Model crown = LoadModelFromMesh(GenMeshCone(1.0f, 1.8f, 10));
+    Model logModel = LoadModelFromMesh(GenMeshCylinder(0.22f, 1.0f, 10));
+    Model stoneModel = LoadModelFromMesh(GenMeshSphere(1.0f, 10, 10));
+
+    ApplyShader(ground, shader);
+    ApplyShader(unitCube, shader);
+    ApplyShader(trunk, shader);
+    ApplyShader(crown, shader);
+    ApplyShader(logModel, shader);
+    ApplyShader(stoneModel, shader);
+
+    ApplyTexture(ground, groundTexture);
+    ApplyTexture(unitCube, woodTexture);
+    ApplyTexture(trunk, barkTexture);
+    ApplyTexture(crown, leafTexture);
+    ApplyTexture(logModel, barkTexture);
+    ApplyTexture(stoneModel, metalTexture);
+
+    // ------------------------------------------------------------
+    // Material controls.
+    // ------------------------------------------------------------
+    bool flashlight = false;
+    int visualMode = 1; // 1 = day, 2 = evening, 3 = night
+
+    float yaw = 180.0f;
+    float pitch = 0.0f;
+    const float mouseSensitivity = 0.0028f;
+    const float walkSpeed = 4.0f;
+    const float runSpeed = 7.0f;
+
+    while (!WindowShouldClose())
+    {
+        float dt = GetFrameTime();
+        if (dt > 0.05f) dt = 0.05f;
+
+        // ---------------- camera ----------------
+        Vector2 mouse = GetMouseDelta();
+        yaw -= mouse.x * mouseSensitivity * 57.2957795f;
+        pitch -= mouse.y * mouseSensitivity * 57.2957795f;
+        pitch = ClampF(pitch, -65.0f, 65.0f);
+
+        float yawRad = yaw * DEG2RAD;
+        float pitchRad = pitch * DEG2RAD;
+
+        Vector3 forward = {
+            cosf(pitchRad) * sinf(yawRad),
+            sinf(pitchRad),
+            cosf(pitchRad) * cosf(yawRad)
+        };
+        forward = Vector3Normalize(forward);
+
+        camera.target = Vector3Add(camera.position, forward);
+
+        Vector3 right = Vector3Normalize(Vector3CrossProduct(forward, { 0.0f, 1.0f, 0.0f }));
+        Vector3 movement = Vector3Zero();
+
+        if (IsKeyDown(KEY_W)) movement = Vector3Add(movement, forward);
+        if (IsKeyDown(KEY_S)) movement = Vector3Subtract(movement, forward);
+        if (IsKeyDown(KEY_D)) movement = Vector3Add(movement, right);
+        if (IsKeyDown(KEY_A)) movement = Vector3Subtract(movement, right);
+
+        if (Vector3Length(movement) > 0.001f)
+        {
+            movement.y = 0.0f;
+            movement = Vector3Normalize(movement);
+            float speed = IsKeyDown(KEY_LEFT_SHIFT) ? runSpeed : walkSpeed;
+            camera.position = Vector3Add(camera.position, Vector3Scale(movement, speed * dt));
+        }
+
+        camera.position.x = ClampF(camera.position.x, -195.0f, 195.0f);
+        camera.position.z = ClampF(camera.position.z, -195.0f, 195.0f);
+        camera.position.y = GetTerrainHeight(camera.position.x, camera.position.z) + 2.15f;
+
+        if (IsKeyPressed(KEY_F)) flashlight = !flashlight;
+        if (IsKeyPressed(KEY_ONE)) visualMode = 1;
+        if (IsKeyPressed(KEY_TWO)) visualMode = 2;
+        if (IsKeyPressed(KEY_THREE)) visualMode = 3;
+
+        // ---------------- atmosphere ----------------
+        Color skyTop;
+        Color skyHorizon;
+        Vector3 sunDir;
+        Vector3 sunColor;
+        float sunIntensity;
+        Vector3 ambientColor;
+        float ambientStrength;
+        Vector3 fogColor;
+        float fogNear;
+        float fogFar;
+
+        if (visualMode == 1)
+        {
+            skyTop = { 95, 132, 162, 255 };
+            skyHorizon = { 164, 177, 184, 255 };
+            sunDir = { 0.25f, -1.0f, -0.35f };
+            sunColor = { 1.0f, 0.95f, 0.88f };
+            sunIntensity = 2.2f;
+            ambientColor = { 0.54f, 0.58f, 0.62f };
+            ambientStrength = 0.62f;
+            fogColor = { 136.0f / 255.0f, 154.0f / 255.0f, 164.0f / 255.0f };
+            fogNear = 75.0f;
+            fogFar = 220.0f;
+        }
+        else if (visualMode == 2)
+        {
+            skyTop = { 45, 52, 68, 255 };
+            skyHorizon = { 149, 104, 76, 255 };
+            sunDir = { -0.35f, -0.72f, -0.25f };
+            sunColor = { 1.0f, 0.46f, 0.26f };
+            sunIntensity = 1.45f;
+            ambientColor = { 0.31f, 0.25f, 0.28f };
+            ambientStrength = 0.42f;
+            fogColor = { 92.0f / 255.0f, 82.0f / 255.0f, 86.0f / 255.0f };
+            fogNear = 58.0f;
+            fogFar = 170.0f;
+        }
+        else
+        {
+            skyTop = { 4, 8, 17, 255 };
+            skyHorizon = { 18, 27, 42, 255 };
+            sunDir = { -0.35f, -0.75f, 0.15f };
+            sunColor = { 0.27f, 0.39f, 0.62f };
+            sunIntensity = 0.34f;
+            ambientColor = { 0.08f, 0.11f, 0.17f };
+            ambientStrength = 0.42f;
+            fogColor = { 10.0f / 255.0f, 16.0f / 255.0f, 25.0f / 255.0f };
+            fogNear = 28.0f;
+            fogFar = 100.0f;
+        }
+
+        sunDir = Vector3Normalize(sunDir);
+
+        SetShaderValue(shader, viewPosLoc, &camera.position, SHADER_UNIFORM_VEC3);
+        SetShaderValue(shader, sunDirectionLoc, &sunDir, SHADER_UNIFORM_VEC3);
+        SetShaderValue(shader, sunColorLoc, &sunColor, SHADER_UNIFORM_VEC3);
+        SetShaderValue(shader, sunIntensityLoc, &sunIntensity, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(shader, ambientColorLoc, &ambientColor, SHADER_UNIFORM_VEC3);
+        SetShaderValue(shader, ambientStrengthLoc, &ambientStrength, SHADER_UNIFORM_FLOAT);
+
+        Vector3 firePosition = { 0.0f, 1.15f, -1.0f };
+        Vector3 fireColor = { 1.0f, 0.30f, 0.055f };
+        float fireIntensity = (visualMode == 3 ? 8.0f : (visualMode == 2 ? 5.5f : 2.0f));
+        float fireRadius = 15.0f;
+
+        SetShaderValue(shader, firePositionLoc, &firePosition, SHADER_UNIFORM_VEC3);
+        SetShaderValue(shader, fireColorLoc, &fireColor, SHADER_UNIFORM_VEC3);
+        SetShaderValue(shader, fireIntensityLoc, &fireIntensity, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(shader, fireRadiusLoc, &fireRadius, SHADER_UNIFORM_FLOAT);
+
+        Vector3 flashPosition = camera.position;
+        SetShaderValue(shader, flashPositionLoc, &flashPosition, SHADER_UNIFORM_VEC3);
+        SetShaderValue(shader, flashDirectionLoc, &forward, SHADER_UNIFORM_VEC3);
+        float flashEnabled = flashlight ? 1.0f : 0.0f;
+        float flashIntensity = 9.0f;
+        float flashRange = 34.0f;
+        SetShaderValue(shader, flashEnabledLoc, &flashEnabled, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(shader, flashIntensityLoc, &flashIntensity, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(shader, flashRangeLoc, &flashRange, SHADER_UNIFORM_FLOAT);
+
+        SetShaderValue(shader, fogColorLoc, &fogColor, SHADER_UNIFORM_VEC3);
+        SetShaderValue(shader, fogNearLoc, &fogNear, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(shader, fogFarLoc, &fogFar, SHADER_UNIFORM_FLOAT);
+
+        // ---------------- draw ----------------
+        BeginDrawing();
+        ClearBackground(skyTop);
+
+        // Very soft horizon band before 3D scene.
+        DrawRectangleGradientV(0, 0, screenWidth, screenHeight / 2,
+                               skyTop, skyHorizon);
+        DrawRectangle(0, screenHeight / 2, screenWidth, screenHeight / 2,
+                      ColorAlpha(skyHorizon, 26));
+
+        BeginMode3D(camera);
+
+        // Ground.
+        SetMaterialParams(shader, uvScaleLoc, roughnessLoc, metallicLoc,
+                          42.0f, 42.0f, 0.92f, 0.0f);
+        DrawModel(ground, { 0.0f, 0.0f, 0.0f }, 1.0f, WHITE);
+
+        // Main cabin shell (visual-only version).
+        SetMaterialParams(shader, uvScaleLoc, roughnessLoc, metallicLoc,
+                          3.6f, 1.0f, 0.72f, 0.0f);
+
+        DrawModelScaled(unitCube, { 0.0f, 2.1f, 20.0f }, { 14.0f, 4.2f, 0.45f }, WHITE);
+        DrawModelScaled(unitCube, { -6.8f, 2.1f, 20.0f }, { 0.45f, 4.2f, 9.2f }, WHITE);
+        DrawModelScaled(unitCube, { 6.8f, 2.1f, 20.0f }, { 0.45f, 4.2f, 9.2f }, WHITE);
+        DrawModelScaled(unitCube, { 0.0f, 2.1f, 24.6f }, { 14.0f, 4.2f, 0.45f }, WHITE);
+        DrawModelScaled(unitCube, { -4.25f, 2.1f, 15.45f }, { 5.5f, 4.2f, 0.45f }, WHITE);
+        DrawModelScaled(unitCube, { 4.25f, 2.1f, 15.45f }, { 5.5f, 4.2f, 0.45f }, WHITE);
+
+        // Roof.
+        SetMaterialParams(shader, uvScaleLoc, roughnessLoc, metallicLoc,
+                          2.5f, 2.5f, 0.38f, 0.62f);
+        DrawModelScaled(unitCube, { 0.0f, 4.55f, 20.0f }, { 15.2f, 0.55f, 10.6f }, WHITE);
+
+        // Door and windows.
+        SetMaterialParams(shader, uvScaleLoc, roughnessLoc, metallicLoc,
+                          2.2f, 2.2f, 0.50f, 0.0f);
+        DrawModelScaled(unitCube, { 0.0f, 1.35f, 15.18f }, { 2.45f, 2.7f, 0.16f }, WHITE);
+
+        SetMaterialParams(shader, uvScaleLoc, roughnessLoc, metallicLoc,
+                          1.5f, 1.5f, 0.18f, 0.05f);
+        DrawModelScaled(unitCube, { -4.3f, 2.1f, 15.18f }, { 1.8f, 1.05f, 0.08f }, { 190, 220, 228, 255 });
+        DrawModelScaled(unitCube, {  4.3f, 2.1f, 15.18f }, { 1.8f, 1.05f, 0.08f }, { 190, 220, 228, 255 });
+
+        // Old cabins.
+        SetMaterialParams(shader, uvScaleLoc, roughnessLoc, metallicLoc,
+                          2.8f, 1.0f, 0.80f, 0.0f);
+        DrawModelScaled(unitCube, { -25.0f, 1.65f, -12.0f }, { 8.0f, 3.3f, 6.0f }, WHITE);
+        DrawModelScaled(unitCube, { 25.0f, 1.65f, -12.0f }, { 8.0f, 3.3f, 6.0f }, WHITE);
+        DrawModelScaled(unitCube, { -18.0f, 1.65f, 13.0f }, { 7.0f, 3.3f, 5.5f }, WHITE);
+        DrawModelScaled(unitCube, { 18.0f, 1.65f, 13.0f }, { 7.0f, 3.3f, 5.5f }, WHITE);
+
+        // Shed / metal structure.
+        SetMaterialParams(shader, uvScaleLoc, roughnessLoc, metallicLoc,
+                          2.6f, 2.2f, 0.46f, 0.72f);
+        DrawModelScaled(unitCube, { 30.0f, 2.25f, 0.0f }, { 8.0f, 4.5f, 7.0f }, WHITE);
+
+        // Fire pit base.
+        SetMaterialParams(shader, uvScaleLoc, roughnessLoc, metallicLoc,
+                          1.0f, 1.0f, 0.95f, 0.0f);
+        DrawModelScaled(stoneModel, { 0.0f, 0.28f, -1.0f }, { 2.0f, 0.28f, 2.0f }, WHITE);
+        for (int i = 0; i < 10; ++i)
+        {
+            float a = (float)i / 10.0f * PI * 2.0f;
+            Vector3 p = { cosf(a) * 1.55f, 0.28f, -1.0f + sinf(a) * 1.55f };
+            DrawModelScaled(stoneModel, p, { 0.42f, 0.30f, 0.30f }, WHITE);
+        }
+
+        // Logs.
+        SetMaterialParams(shader, uvScaleLoc, roughnessLoc, metallicLoc,
+                          2.5f, 1.0f, 0.88f, 0.0f);
+        DrawModelScaled(logModel, { -3.0f, 0.45f, -1.2f }, { 1.0f, 1.0f, 3.0f }, WHITE);
+        DrawModelScaled(logModel, {  3.0f, 0.45f, -1.2f }, { 1.0f, 1.0f, 3.0f }, WHITE);
+
+        // Fire mesh (default geometry color is fine for a bright hotspot).
+        float firePulse = 0.88f + 0.15f * sinf((float)GetTime() * 12.0f);
+        Color flameA = { 255, (unsigned char)(80.0f * firePulse), 20, 255 };
+        Color flameB = { 255, 220, 95, 255 };
+        DrawSphere({ 0.0f, 0.95f, -1.0f }, 0.62f * firePulse, flameA);
+        DrawSphere({ 0.0f, 1.35f, -1.0f }, 0.36f * firePulse, flameB);
+
+        // Crates.
+        SetMaterialParams(shader, uvScaleLoc, roughnessLoc, metallicLoc,
+                          1.8f, 1.8f, 0.76f, 0.0f);
+        DrawModelScaled(unitCube, { -5.0f, 0.65f, 6.0f }, { 1.3f, 1.3f, 1.3f }, WHITE);
+        DrawModelScaled(unitCube, { -3.5f, 0.65f, 6.0f }, { 1.3f, 1.3f, 1.3f }, WHITE);
+        DrawModelScaled(unitCube, {  4.2f, 0.65f, 6.7f }, { 1.3f, 1.3f, 1.3f }, WHITE);
+
+        // Old car-ish silhouette.
+        SetMaterialParams(shader, uvScaleLoc, roughnessLoc, metallicLoc,
+                          2.3f, 1.8f, 0.34f, 0.78f);
+        DrawModelScaled(unitCube, { -18.0f, 0.85f, 8.0f }, { 5.3f, 1.2f, 2.5f }, WHITE);
+        SetMaterialParams(shader, uvScaleLoc, roughnessLoc, metallicLoc,
+                          1.5f, 1.5f, 0.16f, 0.04f);
+        DrawModelScaled(unitCube, { -18.0f, 1.55f, 8.15f }, { 3.2f, 0.75f, 1.8f }, { 55, 70, 78, 255 });
+
+        // Forest: terrain-aware trees. Their trunks are intentionally buried a little
+        // into the terrain so there can be no visible floating gap.
+        for (int i = 0; i < 165; ++i)
+        {
+            float fx = (float)((int)HashU32((unsigned int)(i * 19)) % 360 - 180);
+            float fz = (float)((int)HashU32((unsigned int)(i * 31 + 9)) % 360 - 180);
+
+            // Keep a broad gameplay clearing around the camp.
+            if (fabsf(fx) < 58.0f && fabsf(fz) < 58.0f)
+                continue;
+
+            // Clear simple paths / access lanes so the forest reads naturally.
+            bool onNorthSouthPath = fabsf(fx) < 7.0f && fz > -55.0f && fz < 45.0f;
+            bool onEastWestPath = fabsf(fz + 1.0f) < 6.0f && fx > -55.0f && fx < 55.0f;
+            if (onNorthSouthPath || onEastWestPath)
+                continue;
+
+            float h = 0.80f + Hash01(i, 4, 44) * 0.62f;
+            float radius = 0.82f + Hash01(i, 11, 58) * 0.48f;
+            float treeYaw = Hash01(i, 17, 62) * 360.0f;
+
+            DrawPineTree(trunk, crown, shader, uvScaleLoc, roughnessLoc, metallicLoc,
+                         { fx, 0.0f, fz }, h, radius, treeYaw);
+        }
+
+        // Foreground trees: larger silhouettes for depth and stronger sense of scale.
+        const Vector3 foregroundTrees[8] =
+        {
+            { -32.0f, 0.0f, -20.0f },
+            {  30.0f, 0.0f, -28.0f },
+            { -36.0f, 0.0f,  22.0f },
+            {  34.0f, 0.0f,  18.0f },
+            { -48.0f, 0.0f,   4.0f },
+            {  48.0f, 0.0f,   2.0f },
+            { -55.0f, 0.0f, -34.0f },
+            {  55.0f, 0.0f, -34.0f }
+        };
+
+        for (int i = 0; i < 8; ++i)
+        {
+            float heightScale = 1.22f + (float)(i % 3) * 0.12f;
+            float radiusScale = 1.12f + (float)(i % 2) * 0.10f;
+            float treeYaw = (float)(i * 47);
+            DrawPineTree(trunk, crown, shader, uvScaleLoc, roughnessLoc, metallicLoc,
+                         foregroundTrees[i], heightScale, radiusScale, treeYaw);
+        }
+
+        // Small stones naturally follow the terrain, giving the ground scale.
+        SetMaterialParams(shader, uvScaleLoc, roughnessLoc, metallicLoc,
+                          1.0f, 1.0f, 0.96f, 0.0f);
+        for (int i = 0; i < 30; ++i)
+        {
+            float rx = (float)((int)HashU32((unsigned int)(i * 73 + 5)) % 230 - 115);
+            float rz = (float)((int)HashU32((unsigned int)(i * 91 + 11)) % 230 - 115);
+
+            if (fabsf(rx) < 45.0f && fabsf(rz) < 45.0f)
+                continue;
+
+            float ry = GetTerrainHeight(rx, rz) + 0.18f;
+            float s = 0.18f + Hash01(i, 33, 81) * 0.28f;
+            DrawModelScaled(stoneModel, { rx, ry, rz }, { s * 1.6f, s * 0.75f, s }, WHITE);
+        }
+
+        EndMode3D();
+
+        // Crosshair.
+        int cx = screenWidth / 2;
+        int cy = screenHeight / 2;
+        DrawLine(cx - 5, cy, cx + 5, cy, ColorAlpha(WHITE, 0.85f));
+        DrawLine(cx, cy - 5, cx, cy + 5, ColorAlpha(WHITE, 0.85f));
+
+        // UI.
+        DrawRectangle(18, 18, 385, 102, ColorAlpha(BLACK, 0.52f));
+        DrawRectangleLines(18, 18, 385, 102, ColorAlpha(WHITE, 0.16f));
+        DrawText("DO RASSVETA - VISUAL 2.1", 32, 32, 24, WHITE);
+        DrawText("1 DAY   2 EVENING   3 NIGHT", 32, 65, 17, LIGHTGRAY);
+        DrawText(flashlight ? "F FLASHLIGHT: ON" : "F FLASHLIGHT: OFF", 32, 90, 17, LIGHTGRAY);
+
+        DrawRectangle(screenWidth - 255, 18, 225, 48, ColorAlpha(BLACK, 0.48f));
+        DrawText(TextFormat("FPS %d", GetFPS()), screenWidth - 225, 30, 22, WHITE);
+        DrawText("PBR-LITE / TERRAIN / GROUNDED FOREST", screenWidth - 405, screenHeight - 30, 16, ColorAlpha(WHITE, 0.70f));
+
+        EndDrawing();
+    }
+
+    // Cleanup.
+    UnloadModel(ground);
+    UnloadModel(unitCube);
+    UnloadModel(trunk);
+    UnloadModel(crown);
+    UnloadModel(logModel);
+    UnloadModel(stoneModel);
+
+    UnloadShader(shader);
+
+    UnloadTexture(groundTexture);
+    UnloadTexture(woodTexture);
+    UnloadTexture(barkTexture);
+    UnloadTexture(leafTexture);
+    UnloadTexture(metalTexture);
+
+    CloseWindow();
+    return 0;
+}
